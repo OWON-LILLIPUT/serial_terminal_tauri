@@ -508,6 +508,10 @@ input:disabled {
   gap: calc(7px * var(--ui-scale));
 }
 
+#adb-root {
+  margin-top: calc(7px * var(--ui-scale));
+}
+
 .compact-field {
   min-width: 0;
   margin-bottom: 0;

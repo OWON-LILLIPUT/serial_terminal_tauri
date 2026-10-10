@@ -314,6 +314,26 @@
   - `findings.md`
   - `progress.md`
 
+## 会话：2026-10-10
+
+### 阶段 20：新增 ADB ROOT 按钮
+- **状态：** complete
+- 已读取项目规划和当前代码，工作区开始时没有未提交改动。
+- 新按钮位于 scrcpy / ADB Shell 按钮行下方，使用当前选中的 ADB 设备；每次点击执行一次，不判断 root 是否成功。
+- 受限 shell 初始化和 Node 内核失败后，经过自动审批使用非沙箱 shell 完成只读检查。
+- 已新增主题按钮、事件处理和 `adb_root` 异步命令，捕获点击时设备 ID，忽略 root 返回结果；新按钮与上一行保留 7px 的缩放间距。
+- `npm run build`、Rust 格式化、`cargo check --offline --manifest-path src-tauri\Cargo.toml` 和 `git diff --check` 均通过；仅有 Git 换行符提示。
+- 修改文件：`src/main.ts`、`src/styles.css`、`src-tauri/src/lib.rs` 和三个项目规划文件。
+
+### 阶段 21：ADB ROOT 点击后立即返回
+- **状态：** complete
+- 用户反馈点击后按钮变暗、需等待恢复；代码确认设备列表更新时会清空/切换消失的选择，且 root 命令返回仍等进程完成。
+- 将 root 改为启动进程后立即返回，保留 root 目标的选择直到用户主动改选；定时设备查询移到后台线程。
+- 已完成：前端发起调用后立即返回，后端仅等待进程启动；root 输出丢弃，后台线程只回收进程，不检查结果。
+- 已完成：root 目标在定时刷新暂时消失时保持选中；主动选择其他 ADB 设备或连接新远程设备时解除保留。
+- `npm run build`、`cargo fmt` 和 `cargo check --offline --manifest-path src-tauri\Cargo.toml` 均通过。
+- 用模拟 IPC / 设备列表验证连续点击、临时空列表、其他设备仍在线、目标恢复、主动切换和未选设备六种情形；未对真实设备执行 root。
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -386,6 +406,11 @@
 | `cargo check --manifest-path src-tauri\Cargo.toml` | ADB 超时策略优化后 | Rust 后端编译检查通过 | 通过，仅有路径 canonicalize 警告 | 通过 |
 | `npm run build` | ADB 超时策略优化后 | 前端构建仍通过 | 构建通过；仅有 npm 版本提示 | 通过 |
 | `git diff --check` | ADB 超时策略优化后 | 无空白错误 | 通过，仅有 CRLF 提示 | 通过 |
+| `npm run build` | ADB ROOT 按钮与样式 | TypeScript/Vite 构建通过 | 通过 | 通过 |
+| `cargo check --offline --manifest-path src-tauri\Cargo.toml` | ADB ROOT 异步命令 | Rust 编译检查通过 | 通过 | 通过 |
+| `git diff --check` | ADB ROOT 改动 | 无空白错误 | 通过，仅有 CRLF 提示 | 通过 |
+| `npm run build` / `cargo check --offline` | ROOT 立即返回修复 | 前后端编译检查通过 | 通过 | 通过 |
+| 模拟 ROOT 点击与设备刷新 | 连续点击、目标临时消失、其他设备在线、重连、手动切换、无选择 | 每次有效点击只发一次，目标不误切，空选择不执行 | 六种场景均通过 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -412,11 +437,11 @@
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 完成阶段 19：ADB 启动慢时的超时误判优化 |
-| 我要去哪里？ | 等待用户实机确认首次启动 adb server、刷新设备和远程连接不再过早超时 |
+| 我在哪里？ | 完成阶段 21：ADB ROOT 点击后立即返回 |
+| 我要去哪里？ | 等待用户验证按钮立即可再次点击 |
 | 目标是什么？ | Tauri 版达到可用的串口终端迁移状态 |
 | 我学到了什么？ | 见 findings.md |
-| 我做了什么？ | 为 ADB server 启动增加独立长超时，并放宽普通 ADB 命令/连接命令超时 |
+| 我做了什么？ | 新增 ADB ROOT 按钮和异步命令，每次点击对当前设备执行一次 root，忽略其结果 |
 
 ---
 *每个阶段完成后或遇到错误时更新此文件*

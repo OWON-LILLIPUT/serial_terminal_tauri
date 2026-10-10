@@ -261,6 +261,7 @@ let pendingStatsUpdate = false;
 let lastPerfReportAt = 0;
 let sidebarScrollTop = 0;
 let adbRefreshInFlight = false;
+let adbRootDeviceId = "";
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
@@ -510,6 +511,14 @@ function renderAndroidSections(): string {
           ${adbShellButtonText()}
         </button>
       </div>
+      <button
+        id="adb-root"
+        class="secondary-button full-button"
+        type="button"
+        ${!state.selectedAdbDevice ? "disabled" : ""}
+      >
+        执行 ADB ROOT
+      </button>
       ${state.androidMessage ? `<div class="helper-text">${escapeHtml(state.androidMessage)}</div>` : ""}
       ${state.androidError ? `<div class="error-text">${escapeHtml(state.androidError)}</div>` : ""}
     </section>
@@ -881,6 +890,10 @@ function bindAndroidEvents(): void {
   document.querySelector("#adb-shell-open")?.addEventListener("click", () => {
     void toggleAdbShell();
   });
+
+  document.querySelector("#adb-root")?.addEventListener("click", () => {
+    executeAdbRoot();
+  });
 }
 
 function renderTerminalContextMenu(): string {
@@ -1184,6 +1197,7 @@ function selectPickerOption(id: PickerId, value: string): void {
     applyTerminalOptions();
   } else if (id === "adbDevice") {
     state.selectedAdbDevice = value;
+    adbRootDeviceId = "";
     syncRemoteAdbInputWithSelectedDevice(true);
   } else if (id === "scrcpyCodec") {
     if (scrcpyParametersLocked()) {
@@ -1422,7 +1436,8 @@ function applyAndroidState(androidState: AndroidStatePayload): void {
   const selectedDeviceExists = state.adbDevices.some(
     (device) => device.id === state.selectedAdbDevice,
   );
-  if (!selectedDeviceExists) {
+  const preserveRootSelection = !!adbRootDeviceId && state.selectedAdbDevice === adbRootDeviceId;
+  if (!selectedDeviceExists && !preserveRootSelection) {
     const firstOnlineDevice = state.adbDevices.find((device) => device.state === "device");
     state.selectedAdbDevice = firstOnlineDevice?.id ?? state.adbDevices[0]?.id ?? "";
   }
@@ -1466,6 +1481,7 @@ async function toggleRemoteAdb(): Promise<void> {
     } else {
       state.remoteAdbInput = result.address;
       state.selectedAdbDevice = result.address;
+      adbRootDeviceId = "";
     }
     state.remoteAdbMessage =
       result.message || `${connected ? "已断开" : "已连接"} ${result.address}`;
@@ -1477,6 +1493,19 @@ async function toggleRemoteAdb(): Promise<void> {
 
   await refreshAdbState(false);
   renderApp();
+}
+
+function executeAdbRoot(): void {
+  const deviceId = state.selectedAdbDevice;
+  if (!deviceId) {
+    return;
+  }
+
+  adbRootDeviceId = deviceId;
+  void invoke<void>("adb_root", { deviceId }).catch((error) => {
+    state.androidError = toMessage(error);
+    renderApp();
+  });
 }
 
 async function toggleScrcpy(): Promise<void> {
@@ -1731,6 +1760,11 @@ function updateAndroidControls(): void {
     adbShellOpen.disabled = state.adbShellBusy || !canOpenAdbShell();
     adbShellOpen.textContent = adbShellButtonText();
     adbShellOpen.classList.toggle("danger-button", running);
+  }
+
+  const adbRoot = document.querySelector<HTMLButtonElement>("#adb-root");
+  if (adbRoot) {
+    adbRoot.disabled = !state.selectedAdbDevice;
   }
 
   const selectedDeviceStatus = adbDeviceState(state.selectedAdbDevice);

@@ -371,8 +371,40 @@ fn adb_disconnect(address: String) -> Result<AdbCommandResult, String> {
 }
 
 #[tauri::command]
-fn list_adb_state(manager: State<'_, AndroidManager>) -> Result<AndroidState, String> {
-    let output = run_adb_command(&["devices"], ADB_COMMAND_TIMEOUT_MS)?;
+async fn adb_root(device_id: String) -> Result<(), String> {
+    let device_id = normalize_device_id(&device_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let adb_path = find_tool_path("adb")?;
+        let mut command = Command::new(&adb_path);
+        if let Some(adb_dir) = adb_path.parent() {
+            command.current_dir(adb_dir);
+        }
+        command
+            .args(["-s", &device_id, "root"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_command_window(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("启动 ADB ROOT 命令失败: {error}"))?;
+        // Reap the child in the background without waiting for or interpreting its result.
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("执行 ADB ROOT 任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn list_adb_state(manager: State<'_, AndroidManager>) -> Result<AndroidState, String> {
+    let output = tauri::async_runtime::spawn_blocking(|| {
+        run_adb_command(&["devices"], ADB_COMMAND_TIMEOUT_MS)
+    })
+    .await
+    .map_err(|error| format!("刷新 ADB 设备任务失败: {error}"))??;
     let devices = parse_adb_devices(&output);
     let scrcpy_devices = {
         let mut processes = manager
@@ -1429,6 +1461,7 @@ pub fn run() {
             report_perf,
             adb_connect,
             adb_disconnect,
+            adb_root,
             list_adb_state,
             list_scrcpy_devices,
             start_scrcpy,
