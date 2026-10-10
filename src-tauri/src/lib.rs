@@ -16,6 +16,9 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
+mod adb_server;
+use adb_server::{AdbServerManager, AdbServerPhase, AdbServerStatus};
+
 #[cfg(windows)]
 use std::os::windows::{io::AsRawHandle, process::CommandExt};
 
@@ -47,8 +50,6 @@ const ADB_COMMAND_TIMEOUT_MS: u64 = 8_000;
 const COMMAND_POLL_INTERVAL_MS: u64 = 25;
 const COMMAND_OUTPUT_DRAIN_TIMEOUT_MS: u64 = 250;
 const PROCESS_TERMINATE_TIMEOUT_MS: u64 = 500;
-static ADB_SERVER_STARTED: AtomicBool = AtomicBool::new(false);
-static ADB_SERVER_START_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Default)]
 struct SerialManager {
@@ -73,6 +74,7 @@ struct SerialState {
 }
 
 struct AndroidManager {
+    adb_server: AdbServerManager,
     scrcpy_processes: Mutex<HashMap<String, Child>>,
     adb_shells: Arc<Mutex<HashMap<String, AdbShellHandle>>>,
     next_adb_shell_id: AtomicU64,
@@ -92,6 +94,7 @@ impl Default for AndroidManager {
         };
 
         Self {
+            adb_server: AdbServerManager::default(),
             scrcpy_processes: Mutex::new(HashMap::new()),
             adb_shells: Arc::new(Mutex::new(HashMap::new())),
             next_adb_shell_id: AtomicU64::new(1),
@@ -349,9 +352,20 @@ fn report_perf(message: String) {
 }
 
 #[tauri::command]
-fn adb_connect(address: String) -> Result<AdbCommandResult, String> {
+async fn adb_connect(app: AppHandle, address: String) -> Result<AdbCommandResult, String> {
+    run_android_task(app, move |app, manager| {
+        adb_connect_inner(app, manager, address)
+    })
+    .await
+}
+
+fn adb_connect_inner(
+    app: &AppHandle,
+    manager: &AndroidManager,
+    address: String,
+) -> Result<AdbCommandResult, String> {
     let address = normalize_adb_address(&address)?;
-    let message = run_adb_command(&["connect", &address], ADB_CONNECT_TIMEOUT_MS)?;
+    let message = run_adb_command(app, manager, &["connect", &address], ADB_CONNECT_TIMEOUT_MS)?;
 
     if is_adb_connect_failure(&message) {
         return Err(format!(
@@ -364,9 +378,25 @@ fn adb_connect(address: String) -> Result<AdbCommandResult, String> {
 }
 
 #[tauri::command]
-fn adb_disconnect(address: String) -> Result<AdbCommandResult, String> {
+async fn adb_disconnect(app: AppHandle, address: String) -> Result<AdbCommandResult, String> {
+    run_android_task(app, move |app, manager| {
+        adb_disconnect_inner(app, manager, address)
+    })
+    .await
+}
+
+fn adb_disconnect_inner(
+    app: &AppHandle,
+    manager: &AndroidManager,
+    address: String,
+) -> Result<AdbCommandResult, String> {
     let address = normalize_adb_address(&address)?;
-    let message = run_adb_command(&["disconnect", &address], ADB_COMMAND_TIMEOUT_MS)?;
+    let message = run_adb_command(
+        app,
+        manager,
+        &["disconnect", &address],
+        ADB_COMMAND_TIMEOUT_MS,
+    )?;
     Ok(AdbCommandResult { address, message })
 }
 
@@ -399,12 +429,12 @@ async fn adb_root(device_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn list_adb_state(manager: State<'_, AndroidManager>) -> Result<AndroidState, String> {
-    let output = tauri::async_runtime::spawn_blocking(|| {
-        run_adb_command(&["devices"], ADB_COMMAND_TIMEOUT_MS)
-    })
-    .await
-    .map_err(|error| format!("刷新 ADB 设备任务失败: {error}"))??;
+async fn list_adb_state(app: AppHandle) -> Result<AndroidState, String> {
+    run_android_task(app, list_adb_state_inner).await
+}
+
+fn list_adb_state_inner(app: &AppHandle, manager: &AndroidManager) -> Result<AndroidState, String> {
+    let output = run_adb_command(app, manager, &["devices"], ADB_COMMAND_TIMEOUT_MS)?;
     let devices = parse_adb_devices(&output);
     let scrcpy_devices = {
         let mut processes = manager
@@ -422,7 +452,11 @@ async fn list_adb_state(manager: State<'_, AndroidManager>) -> Result<AndroidSta
 }
 
 #[tauri::command]
-fn list_scrcpy_devices(manager: State<'_, AndroidManager>) -> Result<Vec<String>, String> {
+async fn list_scrcpy_devices(app: AppHandle) -> Result<Vec<String>, String> {
+    run_android_task(app, |_, manager| list_scrcpy_devices_inner(manager)).await
+}
+
+fn list_scrcpy_devices_inner(manager: &AndroidManager) -> Result<Vec<String>, String> {
     let mut processes = manager
         .scrcpy_processes
         .lock()
@@ -432,8 +466,20 @@ fn list_scrcpy_devices(manager: State<'_, AndroidManager>) -> Result<Vec<String>
 }
 
 #[tauri::command]
-fn start_scrcpy(
-    manager: State<'_, AndroidManager>,
+async fn start_scrcpy(
+    app: AppHandle,
+    device_id: String,
+    options: ScrcpyOptions,
+) -> Result<(), String> {
+    run_android_task(app, move |app, manager| {
+        start_scrcpy_inner(app, manager, device_id, options)
+    })
+    .await
+}
+
+fn start_scrcpy_inner(
+    app: &AppHandle,
+    manager: &AndroidManager,
     device_id: String,
     options: ScrcpyOptions,
 ) -> Result<(), String> {
@@ -451,8 +497,10 @@ fn start_scrcpy(
         }
     }
 
+    let adb_path = ensure_adb_server_started(app, manager)?;
     let scrcpy_path = find_tool_path("scrcpy")?;
     let mut command = Command::new(&scrcpy_path);
+    command.env("ADB", &adb_path);
     if let Some(scrcpy_dir) = scrcpy_path.parent() {
         command.current_dir(scrcpy_dir);
     }
@@ -487,7 +535,11 @@ fn start_scrcpy(
 }
 
 #[tauri::command]
-fn stop_scrcpy(manager: State<'_, AndroidManager>, device_id: String) -> Result<(), String> {
+async fn stop_scrcpy(app: AppHandle, device_id: String) -> Result<(), String> {
+    run_android_task(app, move |_, manager| stop_scrcpy_inner(manager, device_id)).await
+}
+
+fn stop_scrcpy_inner(manager: &AndroidManager, device_id: String) -> Result<(), String> {
     let device_id = normalize_device_id(&device_id)?;
     let mut processes = manager
         .scrcpy_processes
@@ -506,9 +558,16 @@ fn stop_scrcpy(manager: State<'_, AndroidManager>, device_id: String) -> Result<
 }
 
 #[tauri::command]
-fn start_adb_shell(
-    app: AppHandle,
-    manager: State<'_, AndroidManager>,
+async fn start_adb_shell(app: AppHandle, device_id: String) -> Result<AdbShellStart, String> {
+    run_android_task(app, move |app, manager| {
+        start_adb_shell_inner(app, manager, device_id)
+    })
+    .await
+}
+
+fn start_adb_shell_inner(
+    app: &AppHandle,
+    manager: &AndroidManager,
     device_id: String,
 ) -> Result<AdbShellStart, String> {
     let device_id = normalize_device_id(&device_id)?;
@@ -527,7 +586,7 @@ fn start_adb_shell(
         }
     }
 
-    let adb_path = find_tool_path("adb")?;
+    let adb_path = ensure_adb_server_started(app, manager)?;
     let mut command = Command::new(&adb_path);
     if let Some(adb_dir) = adb_path.parent() {
         command.current_dir(adb_dir);
@@ -584,7 +643,14 @@ fn start_adb_shell(
     spawn_adb_shell_writer(stdin, stdin_rx, Arc::clone(&stop));
     spawn_adb_shell_reader(app.clone(), device_id.clone(), shell_id, stdout);
     spawn_adb_shell_reader(app.clone(), device_id.clone(), shell_id, stderr);
-    spawn_adb_shell_monitor(app, shells, device_id.clone(), shell_id, child, stop);
+    spawn_adb_shell_monitor(
+        app.clone(),
+        shells,
+        device_id.clone(),
+        shell_id,
+        child,
+        stop,
+    );
 
     Ok(AdbShellStart {
         device_id,
@@ -592,7 +658,7 @@ fn start_adb_shell(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn write_adb_shell(
     manager: State<'_, AndroidManager>,
     device_id: String,
@@ -621,7 +687,14 @@ fn write_adb_shell(
 }
 
 #[tauri::command]
-fn stop_adb_shell(manager: State<'_, AndroidManager>, device_id: String) -> Result<(), String> {
+async fn stop_adb_shell(app: AppHandle, device_id: String) -> Result<(), String> {
+    run_android_task(app, move |_, manager| {
+        stop_adb_shell_inner(manager, device_id)
+    })
+    .await
+}
+
+fn stop_adb_shell_inner(manager: &AndroidManager, device_id: String) -> Result<(), String> {
     let device_id = normalize_device_id(&device_id)?;
     let handle = {
         let mut sessions = manager
@@ -1080,26 +1153,52 @@ fn normalize_scrcpy_options(options: ScrcpyOptions) -> Result<ScrcpyOptions, Str
     })
 }
 
-fn run_adb_command(args: &[&str], timeout_ms: u64) -> Result<String, String> {
-    let adb_path = find_tool_path("adb")?;
-    ensure_adb_server_started(&adb_path)?;
+async fn run_android_task<T: Send + 'static>(
+    app: AppHandle,
+    task: impl FnOnce(&AppHandle, &AndroidManager) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let manager = app.state::<AndroidManager>();
+        task(&app, &manager)
+    })
+    .await
+    .map_err(|error| format!("ADB 后台任务失败: {error}"))?
+}
+
+#[tauri::command(async)]
+fn get_adb_server_status(manager: State<'_, AndroidManager>) -> Result<AdbServerStatus, String> {
+    manager.adb_server.snapshot()
+}
+
+fn run_adb_command(
+    app: &AppHandle,
+    manager: &AndroidManager,
+    args: &[&str],
+    timeout_ms: u64,
+) -> Result<String, String> {
+    let adb_path = ensure_adb_server_started(app, manager)?;
     run_adb_command_with_path(&adb_path, args, timeout_ms)
 }
 
-fn ensure_adb_server_started(adb_path: &Path) -> Result<(), String> {
-    if ADB_SERVER_STARTED.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
-    let _guard = ADB_SERVER_START_LOCK
-        .lock()
-        .map_err(|_| "ADB server 启动锁已损坏".to_string())?;
-    if ADB_SERVER_STARTED.load(Ordering::Acquire) {
-        return Ok(());
-    }
-
-    run_adb_command_with_path(adb_path, &["start-server"], ADB_SERVER_START_TIMEOUT_MS)
-        .map(|_| ADB_SERVER_STARTED.store(true, Ordering::Release))
+fn ensure_adb_server_started(app: &AppHandle, manager: &AndroidManager) -> Result<PathBuf, String> {
+    let notify = |status| {
+        let _ = app.emit("adb-server-status", status);
+    };
+    let adb_path = find_tool_path("adb").map_err(|error| {
+        let _ = manager
+            .adb_server
+            .publish(AdbServerPhase::Failed, error.clone(), notify);
+        error
+    })?;
+    manager.adb_server.ensure_started(
+        adb_server::server_is_running,
+        || {
+            run_adb_command_with_path(&adb_path, &["start-server"], ADB_SERVER_START_TIMEOUT_MS)
+                .map(|_| ())
+        },
+        notify,
+    )?;
+    Ok(adb_path)
 }
 
 fn run_adb_command_with_path(
@@ -1452,6 +1551,14 @@ pub fn run() {
         .manage(SerialManager::default())
         .manage(AndroidManager::default())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let app = app.handle().clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let manager = app.state::<AndroidManager>();
+                let _ = ensure_adb_server_started(&app, &manager);
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_fonts,
             list_ports,
@@ -1462,6 +1569,7 @@ pub fn run() {
             adb_connect,
             adb_disconnect,
             adb_root,
+            get_adb_server_status,
             list_adb_state,
             list_scrcpy_devices,
             start_scrcpy,

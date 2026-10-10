@@ -93,6 +93,12 @@ interface AndroidStatePayload {
   scrcpy_devices: string[];
 }
 
+interface AdbServerStatus {
+  phase: "idle" | "starting" | "ready" | "failed";
+  message: string;
+  revision: number;
+}
+
 interface AdbShellDataPayload {
   device_id: string;
   shell_id: number;
@@ -133,6 +139,7 @@ interface AppState {
   remoteAdbInput: string;
   selectedRemoteAdb: string;
   adbDevices: AdbDevice[];
+  adbServerStatus: AdbServerStatus;
   selectedAdbDevice: string;
   scrcpyDevices: string[];
   scrcpyOptions: ScrcpyOptions;
@@ -220,6 +227,7 @@ const state: AppState = {
   remoteAdbInput: defaultRemoteAdbAddress,
   selectedRemoteAdb: savedSettings.selectedRemoteAdb ?? savedSettings.remoteAdbHistory?.[0] ?? "",
   adbDevices: [],
+  adbServerStatus: { phase: "idle", message: "", revision: 0 },
   selectedAdbDevice: savedSettings.selectedAdbDevice ?? "",
   scrcpyDevices: [],
   scrcpyOptions: {
@@ -414,7 +422,6 @@ function restoreSidebarScroll(): void {
 function renderAndroidSections(): string {
   const remoteAddress = remoteAdbToggleAddress();
   const remoteConnected = remoteAddress ? remoteAdbStatus(remoteAddress) === "device" : false;
-  const selectedDeviceStatus = adbDeviceState(state.selectedAdbDevice);
   const scrcpyRunning = isScrcpyRunning(state.selectedAdbDevice);
   const scrcpyOptions = selectedScrcpyOptions();
   const parametersLocked = scrcpyParametersLocked();
@@ -425,7 +432,7 @@ function renderAndroidSections(): string {
       <div class="section-title section-title-row">
         <span>SCRCPY</span>
         <span class="section-status">
-          <span id="adb-device-status-dot" class="small-dot ${adbStatusTone(selectedDeviceStatus)}"></span>
+          <span id="adb-device-status-dot" class="small-dot ${androidStatusTone()}"></span>
           <span id="adb-device-status-text" title="${escapeAttribute(scrcpyDetail)}">${escapeHtml(scrcpyDetail)}</span>
         </span>
       </div>
@@ -1380,6 +1387,14 @@ async function refreshFonts(): Promise<void> {
   renderApp();
 }
 
+function applyAdbServerStatus(status: AdbServerStatus): void {
+  if (status.revision < state.adbServerStatus.revision) {
+    return;
+  }
+  state.adbServerStatus = status;
+  updateAndroidControls();
+}
+
 async function refreshAdbState(shouldRender = true): Promise<void> {
   if (state.adbBusy || adbRefreshInFlight) {
     return;
@@ -1767,10 +1782,9 @@ function updateAndroidControls(): void {
     adbRoot.disabled = !state.selectedAdbDevice;
   }
 
-  const selectedDeviceStatus = adbDeviceState(state.selectedAdbDevice);
   const deviceStatusDot = document.querySelector("#adb-device-status-dot");
   if (deviceStatusDot) {
-    deviceStatusDot.className = `small-dot ${adbStatusTone(selectedDeviceStatus)}`;
+    deviceStatusDot.className = `small-dot ${androidStatusTone()}`;
   }
   updateTextWithTitle("#adb-device-status-text", scrcpyDetailText());
 }
@@ -2553,7 +2567,23 @@ function adbShellButtonText(): string {
   return session?.closed ? "重新打开 ADB Shell" : "打开 ADB Shell";
 }
 
+function androidStatusTone(): string {
+  if (state.adbServerStatus.phase === "starting") {
+    return "warning";
+  }
+  if (state.adbServerStatus.phase === "failed") {
+    return "error";
+  }
+  return adbStatusTone(adbDeviceState(state.selectedAdbDevice));
+}
+
 function scrcpyDetailText(): string {
+  if (state.adbServerStatus.phase === "starting") {
+    return "ADB 正在启动";
+  }
+  if (state.adbServerStatus.phase === "failed") {
+    return `ADB 启动失败: ${state.adbServerStatus.message}`;
+  }
   if (!state.selectedAdbDevice) {
     return "请选择 ADB 设备";
   }
@@ -2656,6 +2686,18 @@ function toMessage(error: unknown): string {
 }
 
 async function setupBackendListeners(): Promise<void> {
+  await listen<AdbServerStatus>("adb-server-status", (event) => {
+    applyAdbServerStatus(event.payload);
+  });
+  // Initialization may start before the WebView exists. Read its current state
+  // after subscribing; revisions prevent an older snapshot overwriting an event.
+  void invoke<AdbServerStatus>("get_adb_server_status")
+    .then(applyAdbServerStatus)
+    .catch((error) => {
+      state.androidError = toMessage(error);
+      renderApp();
+    });
+
   await listen<SerialDataPayload>("serial-data", (event) => {
     queueSerialOutput(event.payload.data, event.payload.byte_count);
   });

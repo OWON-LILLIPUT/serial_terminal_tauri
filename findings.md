@@ -123,6 +123,12 @@
 | ADB 启动慢导致 3 秒超时误判 | 在执行实际 ADB 命令前先用 20 秒超时启动 adb server，并将普通命令/连接命令超时提高到 8 秒 |
 
 ## 资源
+- 2026-10-10：ADB ROOT 改动已提交为 `d9a1b8b`，本阶段开始时工作区干净。
+- 2026-10-10：`adb_connect` / `adb_disconnect` 在同步 Tauri 命令中等待 `ADB_SERVER_START_LOCK` 和进程输出；scrcpy 启动还在同步命令中固定等待 150ms。统一改为 async command + blocking worker。
+- 2026-10-10：现有 `ADB_SERVER_STARTED` 仅表示曾经启动成功，不能检测 server 被其他软件结束；增加 server 响应探测，失效时重新启动，不重放已发出的 root。
+- 2026-10-10：初始化通知复用现有 SCRCPY 标题状态，事件监听后再读取快照并按版本号防止旧快照覆盖新通知。
+- 2026-10-10：新增独立 `adb_server.rs` 管理 idle/starting/ready/failed 状态，初始化锁仅由 blocking worker 获取；只读 smart-socket `host:version` 验证 server 存活，兼容自定义 TCP server 地址。
+- 2026-10-10：scrcpy 使用与应用相同的 ADB 可执行文件（子进程 `ADB` 环境变量），避免 PATH 解析差异；初始化仍使用 20 秒窗口，实际命令仍使用 8 秒窗口。
 - 2026-10-10（修正）：`applyAndroidState` 在目标暂时消失时会清空或改选其他设备；root 按钮因此禁用，甚至下次点击会命中其他设备。必须保留 root 的当前选择，用户主动改选时解除保留。
 - 2026-10-10（修正）：第一版 root 虽然运行在 blocking worker，但仍等待命令结束后才返回 IPC；改为只启动命令，丢弃输出，后台回收进程句柄。
 - 2026-10-10（修正）：定时 `list_adb_state` 仍是同步 Tauri 命令，可能在 root 重连期间阻塞；设备查询应在 blocking worker 中执行。
