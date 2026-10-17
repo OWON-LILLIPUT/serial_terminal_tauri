@@ -66,6 +66,10 @@
 - ADB 首次调用可能隐式启动 adb server，原先 `ADB_COMMAND_TIMEOUT_MS = 3000`、`ADB_CONNECT_TIMEOUT_MS = 4000` 会把“server 启动慢”误判成命令失败。
 
 ## 技术决策
+- 2026-10-17：文件页独立于 xterm 会话，绑定打开时设备；切换 ADB 下拉不改变已打开文件页操作目标。
+- 2026-10-17：当前 ADB 文本执行器的 8 秒超时不适用于文件传输；新模块提供后台进度、取消、独立超时和进程退出清理。
+- 2026-10-17：远端目录使用 NUL 分隔元数据，避免按空格解析 ls；路径严格引用，拒绝根目录删除和危险名称，覆盖/删除前确认。
+- 2026-10-17：原生文件对话框使用已存在的 windows-sys，不引入 Android Studio 或完整 SDK 依赖。
 | 决策 | 理由 |
 |------|------|
 | 换用 xterm.js | 成熟终端组件覆盖终端核心复杂度，减少自研 bug 面 |
@@ -123,6 +127,9 @@
 | ADB 启动慢导致 3 秒超时误判 | 在执行实际 ADB 命令前先用 20 秒超时启动 adb server，并将普通命令/连接命令超时提高到 8 秒 |
 
 ## 资源
+- 2026-10-17：ADB 原始手册确认 push/pull 支持文件和目录，shell -T 可禁用伪终端，目录元数据保留 NUL 分隔。来源：https://android.googlesource.com/platform/packages/modules/adb/%2Bshow/refs/heads/main/docs/user/adb.1.md
+- 2026-10-17：Toybox 官方帮助确认 stat -c 以及 mv -n/-T；重命名不覆盖、目标不按目录解释。来源：https://landley.net/toybox/help.html
+- 2026-10-17：下载成功提交使用 Windows MoveFileExW，无覆盖授权时以 OS 原子 no-replace 防止目标在检查后出现；失败或取消只清理本次创建的唯一临时目录。
 - 2026-10-10：ADB ROOT 改动已提交为 `d9a1b8b`，本阶段开始时工作区干净。
 - 2026-10-10：`adb_connect` / `adb_disconnect` 在同步 Tauri 命令中等待 `ADB_SERVER_START_LOCK` 和进程输出；scrcpy 启动还在同步命令中固定等待 150ms。统一改为 async command + blocking worker。
 - 2026-10-10：现有 `ADB_SERVER_STARTED` 仅表示曾经启动成功，不能检测 server 被其他软件结束；增加 server 响应探测，失效时重新启动，不重放已发出的 root。

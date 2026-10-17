@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>设备文件第一版 · 隔离 UI 测试</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div style="position:fixed;right:12px;bottom:12px;z-index:150;background:#313244;padding:10px;border:1px solid #585b70;border-radius:7px;font-size:12px;max-width:440px">
+      <button id="run-ui-tests" class="secondary-button" type="button">运行隔离回归测试</button>
+      <span id="ui-test-result">仅模拟设备，不连接真实 ADB</span>
+    </div>
+    <script type="module" src="./device-files-ui.ts"></script>
+  </body>
+</html>

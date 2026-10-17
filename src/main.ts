@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
+import { DeviceFiles } from "./device-files";
+import "./device-files.css";
 import "@xterm/xterm/css/xterm.css";
 
 type ConnectionMode = "disconnected" | "connecting" | "connected" | "error";
@@ -270,11 +272,18 @@ let lastPerfReportAt = 0;
 let sidebarScrollTop = 0;
 let adbRefreshInFlight = false;
 let adbRootDeviceId = "";
+const deviceFiles = new DeviceFiles({
+  activeId: () => state.activeTerminalId,
+  activate: activateTerminalTab,
+  render: renderApp,
+  online: (deviceId) => state.adbDevices.some(device => device.id === deviceId && device.state === "device"),
+});
 
 function renderApp(): void {
   const locked = state.mode === "connected" || state.mode === "connecting";
   const serialConnectionDetail = connectionDetailText();
   captureSidebarScroll();
+  deviceFiles.capture();
 
   app.innerHTML = `
     <div class="app-shell">
@@ -390,16 +399,18 @@ function renderApp(): void {
           </section>
         </aside>
 
-        <section class="terminal-panel">
-          <div id="terminal-host" class="terminal-host"></div>
+        <section class="terminal-panel ${deviceFiles.has(state.activeTerminalId) ? "device-files-panel" : ""}">
+          ${deviceFiles.has(state.activeTerminalId) ? deviceFiles.render(state.activeTerminalId) : '<div id="terminal-host" class="terminal-host"></div>'}
         </section>
       </main>
       ${renderTerminalContextMenu()}
       ${renderPickerPortal()}
+      ${deviceFiles.renderDialog()}
     </div>
   `;
 
   bindChromeEvents();
+  deviceFiles.bind();
   attachTerminal();
   updateStats();
   restoreSidebarScroll();
@@ -526,6 +537,8 @@ function renderAndroidSections(): string {
       >
         执行 ADB ROOT
       </button>
+      <button id="device-files-open" class="secondary-button full-button" type="button"
+        ${!canOpenAdbShell() ? "disabled" : ""}>打开设备文件</button>
       ${state.androidMessage ? `<div class="helper-text">${escapeHtml(state.androidMessage)}</div>` : ""}
       ${state.androidError ? `<div class="error-text">${escapeHtml(state.androidError)}</div>` : ""}
     </section>
@@ -624,12 +637,13 @@ function renderTerminalTabs(): string {
   return `
     <div class="terminal-tabs" role="tablist" aria-label="终端标签">
       ${Array.from(terminalSessions.values()).map(renderTerminalTab).join("")}
+      ${deviceFiles.renderTabs()}
     </div>
   `;
 }
 
 function renderTopbarStats(): string {
-  if (activeTerminalSession().kind !== "serial") {
+  if (deviceFiles.has(state.activeTerminalId) || activeTerminalSession().kind !== "serial") {
     return `<div class="topbar-actions" aria-hidden="true"></div>`;
   }
 
@@ -642,7 +656,7 @@ function renderTopbarStats(): string {
 }
 
 function renderTerminalTab(session: TerminalSession): string {
-  const active = activeTerminalSession().id === session.id;
+  const active = state.activeTerminalId === session.id;
   const tone = terminalSessionTone(session);
   return `
     <button
@@ -698,7 +712,7 @@ function bindTerminalTabEvents(): void {
 }
 
 function activateTerminalTab(id: string): void {
-  if (!terminalSessions.has(id)) {
+  if (!terminalSessions.has(id) && !deviceFiles.has(id)) {
     return;
   }
 
@@ -716,6 +730,7 @@ function activeTerminal(): Terminal {
 }
 
 function focusActiveTerminal(): void {
+  if (deviceFiles.has(state.activeTerminalId)) return;
   activeTerminal().focus();
 }
 
@@ -781,6 +796,8 @@ function queueTerminalText(session: TerminalSession, text: string): void {
 function attachTerminal(): void {
   const host = document.querySelector<HTMLDivElement>("#terminal-host");
   if (!host) {
+    resizeObserver?.disconnect();
+    terminalHost = null;
     return;
   }
 
@@ -900,6 +917,9 @@ function bindAndroidEvents(): void {
 
   document.querySelector("#adb-root")?.addEventListener("click", () => {
     executeAdbRoot();
+  });
+  document.querySelector("#device-files-open")?.addEventListener("click", () => {
+    if (canOpenAdbShell()) deviceFiles.open(state.selectedAdbDevice);
   });
 }
 
@@ -1781,12 +1801,15 @@ function updateAndroidControls(): void {
   if (adbRoot) {
     adbRoot.disabled = !state.selectedAdbDevice;
   }
+  const filesOpen = document.querySelector<HTMLButtonElement>("#device-files-open");
+  if (filesOpen) filesOpen.disabled = !canOpenAdbShell();
 
   const deviceStatusDot = document.querySelector("#adb-device-status-dot");
   if (deviceStatusDot) {
     deviceStatusDot.className = `small-dot ${androidStatusTone()}`;
   }
   updateTextWithTitle("#adb-device-status-text", scrcpyDetailText());
+  deviceFiles.updateConnectivity();
 }
 
 function updatePickerButtonState(id: PickerId, label: string, disabled: boolean): void {
@@ -1997,6 +2020,7 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 function queueFit(): void {
+  if (deviceFiles.has(state.activeTerminalId)) return;
   if (fitQueued) {
     return;
   }
@@ -2004,6 +2028,7 @@ function queueFit(): void {
   fitQueued = true;
   requestAnimationFrame(() => {
     fitQueued = false;
+    if (deviceFiles.has(state.activeTerminalId)) return;
     try {
       activeTerminalSession().fitAddon.fit();
     } catch {

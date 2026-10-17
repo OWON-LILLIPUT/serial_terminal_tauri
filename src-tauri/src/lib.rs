@@ -17,6 +17,8 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 mod adb_server;
+mod device_files;
+mod file_dialog;
 use adb_server::{AdbServerManager, AdbServerPhase, AdbServerStatus};
 
 #[cfg(windows)]
@@ -1540,6 +1542,7 @@ fn cleanup_runtime_resources(serial_manager: &SerialManager, android_manager: &A
 }
 
 fn cleanup_window_resources(window: &tauri::Window) {
+    window.state::<device_files::FileManager>().shutdown();
     let serial_manager = window.state::<SerialManager>();
     let android_manager = window.state::<AndroidManager>();
     cleanup_runtime_resources(&serial_manager, &android_manager);
@@ -1550,6 +1553,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(SerialManager::default())
         .manage(AndroidManager::default())
+        .manage(device_files::FileManager::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app = app.handle().clone();
@@ -1576,7 +1580,12 @@ pub fn run() {
             stop_scrcpy,
             start_adb_shell,
             write_adb_shell,
-            stop_adb_shell
+            stop_adb_shell,
+            device_files::list_device_directory,
+            device_files::mutate_device_file,
+            device_files::choose_device_local_path,
+            device_files::transfer_device_file,
+            device_files::cancel_device_transfer
         ])
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::CloseRequested { .. }) {
