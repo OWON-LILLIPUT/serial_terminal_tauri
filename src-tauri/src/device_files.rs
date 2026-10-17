@@ -20,6 +20,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const CANCELLED: &str = "已取消传输";
 const FILE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const FILE_SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Default)]
@@ -164,6 +165,16 @@ fn run_shell(
     device: &str,
     script: &str,
 ) -> Result<Vec<u8>, String> {
+    run_shell_with_timeout(app, manager, device, script, FILE_COMMAND_TIMEOUT)
+}
+
+fn run_shell_with_timeout(
+    app: &AppHandle,
+    manager: &AndroidManager,
+    device: &str,
+    script: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
     let files = app.state::<FileManager>();
     if files.closing.load(Ordering::SeqCst) {
         return Err("软件正在关闭".into());
@@ -182,9 +193,10 @@ fn run_shell(
     ]);
     command.current_dir(adb.parent().unwrap_or(Path::new(".")));
     hide_command_window(&mut command);
-    let output = capture_file_command(&mut command, &files.closing, |child| {
-        assign_child_to_cleanup_job(manager, child, "设备文件操作")
-    })?;
+    let output =
+        capture_file_command_with_timeout(&mut command, &files.closing, timeout, |child| {
+            assign_child_to_cleanup_job(manager, child, "设备文件操作")
+        })?;
     if !output.status.success() {
         let details = String::from_utf8_lossy(&output.stderr);
         let details = if details.trim().is_empty() {
@@ -221,9 +233,19 @@ impl Drop for FileChild {
     }
 }
 
+#[cfg(test)]
 fn capture_file_command(
     command: &mut Command,
     closing: &AtomicBool,
+    assign: impl FnOnce(&mut Child) -> Result<(), String>,
+) -> Result<Output, String> {
+    capture_file_command_with_timeout(command, closing, FILE_COMMAND_TIMEOUT, assign)
+}
+
+fn capture_file_command_with_timeout(
+    command: &mut Command,
+    closing: &AtomicBool,
+    timeout: Duration,
     assign: impl FnOnce(&mut Child) -> Result<(), String>,
 ) -> Result<Output, String> {
     check_cancel(closing)?;
@@ -256,7 +278,7 @@ fn capture_file_command(
         if closing.load(Ordering::SeqCst) {
             break Err("软件正在关闭".into());
         }
-        if started.elapsed() > FILE_COMMAND_TIMEOUT {
+        if started.elapsed() > timeout {
             break Err("设备文件操作超时，请检查设备连接和目录权限".into());
         }
         match child.try_wait() {
@@ -302,15 +324,16 @@ fn listing_script(path: &str) -> String {
     format!(
         r#"cd -- {} || exit 1
 [ -r . ] && [ -x . ] || {{ echo 'Permission denied' >&2; exit 1; }}
-printf 'STFILES1\000'
-for f in ./* ./.[!.]* ./..?*; do
-  [ -e "$f" ] || [ -L "$f" ] || continue
-  meta=$(stat -c '%s %Y %a' -- "$f") || exit 1
-  kind=other; dir=0
-  if [ -L "$f" ]; then kind=symlink; elif [ -d "$f" ]; then kind=directory; elif [ -f "$f" ]; then kind=file; fi
-  [ ! -d "$f" ] || dir=1
-  printf '%s\000%s\000%s %s\000' "${{f#./}}" "$meta" "$kind" "$dir"
-done"#,
+printf 'STFILES3\000'
+# find batches argv without a per-file shell loop/test/command substitution.
+# Names remain NUL-delimited; stat prints numeric fields only, in the same argv order.
+find . -mindepth 1 -maxdepth 1 -exec sh -c '
+  printf "%s\000" "$#" "$@"
+  stat -c "%s %Y %a %f" -- "$@" || exit 1
+  printf "\000"
+' sh {{}} + || exit 1
+printf 'DIRS\000'
+find -L . -mindepth 1 -maxdepth 1 -type d -print0"#,
         shell_quote(path)
     )
 }
@@ -318,6 +341,9 @@ done"#,
 fn parse_listing(path: &str, output: &[u8]) -> Result<DirectoryListing, String> {
     if output.len() > 16 * 1024 * 1024 {
         return Err("目录过大，请直接输入子目录路径".into());
+    }
+    if output.starts_with(b"STFILES2\0") || output.starts_with(b"STFILES3\0") {
+        return parse_batched_listing(path, output);
     }
     let mut fields = output.split(|byte| *byte == 0);
     if fields.next() != Some(b"STFILES1".as_slice()) {
@@ -359,15 +385,123 @@ fn parse_listing(path: &str, output: &[u8]) -> Result<DirectoryListing, String> 
             return Err("目录项目过多，请直接输入子目录路径".into());
         }
     }
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    entries.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
     Ok(DirectoryListing {
         path: path.into(),
         entries,
     })
+}
+
+fn parse_batched_listing(path: &str, output: &[u8]) -> Result<DirectoryListing, String> {
+    if !output.ends_with(b"\0") {
+        return Err("目录数据不完整，请重试刷新".into());
+    }
+    let fast = output.starts_with(b"STFILES3\0");
+    let mut fields = output.split(|byte| *byte == 0);
+    fields.next();
+    let mut entries = Vec::new();
+    let mut followed_directories = std::collections::HashSet::new();
+    let mut has_directories = false;
+    loop {
+        let count = match fields.next() {
+            None | Some([]) => break,
+            Some(count) => count,
+        };
+        if fast && count == b"DIRS" {
+            has_directories = true;
+            for directory in fields {
+                if directory.is_empty() {
+                    continue;
+                }
+                let directory = std::str::from_utf8(directory).map_err(|_| "目录名称编码无效")?;
+                let directory = directory.strip_prefix("./").ok_or("目录名称无效")?;
+                validate_name(directory)?;
+                followed_directories.insert(directory.to_string());
+            }
+            break;
+        }
+        let count = std::str::from_utf8(count)
+            .map_err(|_| "目录批次无效")?
+            .parse::<usize>()
+            .map_err(|_| "目录批次无效")?;
+        if !(1..=20000).contains(&count) {
+            return Err("目录批次大小无效".into());
+        }
+        let mut names = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = std::str::from_utf8(fields.next().ok_or("文件名不完整")?)
+                .map_err(|_| "设备目录含非 UTF-8 文件名，无法安全操作")?;
+            let name = if fast {
+                name.strip_prefix("./").ok_or("目录文件名无效")?
+            } else {
+                name
+            };
+            validate_name(name)?;
+            let linkdir = if fast {
+                false
+            } else {
+                let value = fields.next().ok_or("目录类型不完整")?;
+                if !matches!(value, b"0" | b"1") {
+                    return Err("目录类型无效".into());
+                }
+                value == b"1"
+            };
+            names.push((name, linkdir));
+        }
+        let metadata = std::str::from_utf8(fields.next().ok_or("目录元数据不完整")?)
+            .map_err(|_| "目录元数据无效")?;
+        let rows: Vec<&str> = metadata.lines().collect();
+        if rows.len() != count {
+            return Err("设备 stat 返回数量不匹配，请重试刷新".into());
+        }
+        for ((name, linkdir), row) in names.into_iter().zip(rows) {
+            let values: Vec<&str> = row.split_whitespace().collect();
+            if values.len() != 4 {
+                return Err("设备 stat 返回格式不兼容".into());
+            }
+            let mode = u32::from_str_radix(values[3], 16).map_err(|_| "文件类型无效")?;
+            let kind = match mode & 0xf000 {
+                0x4000 => "directory",
+                0x8000 => "file",
+                0xa000 => "symlink",
+                _ => "other",
+            };
+            entries.push(FileEntry {
+                name: name.into(),
+                path: join_remote(path, name)?,
+                kind: kind.into(),
+                is_dir: kind == "directory" || (kind == "symlink" && linkdir),
+                size: values[0].parse().map_err(|_| "文件大小无效")?,
+                modified: values[1].parse().map_err(|_| "修改时间无效")?,
+                permissions: values[2].into(),
+            });
+        }
+        if entries.len() > 20000 {
+            return Err("目录项目过多，请直接输入子目录路径".into());
+        }
+    }
+    if fast && !has_directories {
+        return Err("目录类型数据不完整，请重试刷新".into());
+    }
+    for entry in &mut entries {
+        if entry.kind == "symlink" && followed_directories.contains(&entry.name) {
+            entry.is_dir = true;
+        }
+    }
+    entries.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
+    Ok(DirectoryListing {
+        path: path.into(),
+        entries,
+    })
+}
+
+#[tauri::command]
+pub async fn sync_device_files(app: AppHandle, device_id: String) -> Result<(), String> {
+    run_android_task(app, move |app, manager| {
+        // Flush OS filesystem caches on the tab's device. This is not `adb sync` (host upload).
+        run_shell_with_timeout(app, manager, &device_id, "sync", FILE_SYNC_TIMEOUT).map(|_| ())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -983,6 +1117,98 @@ mod tests {
         );
     }
     #[test]
+    fn batched_listing_preserves_names_types_and_directory_links() {
+        let output = "STFILES3\0\
+            4\0./中文 ' $文件.txt\0./.hidden\0./sdcard\0./broken-link\0\
+            42 1700000000 644 81a4\n0 1700000001 755 41ed\n7 1700000002 777 a1ff\n8 1700000003 777 a1ff\n\0\
+            1\0./pipe\0\
+            0 1700000004 600 1180\n\0DIRS\0./.hidden\0./sdcard\0";
+        let listing = parse_listing("/", output.as_bytes()).unwrap();
+        assert_eq!(
+            parse_listing("/", output.replace('\n', "\r\n").as_bytes())
+                .unwrap()
+                .entries
+                .len(),
+            5
+        );
+        assert_eq!(listing.entries.len(), 5);
+        assert_eq!(listing.entries[0].name, ".hidden");
+        assert_eq!(listing.entries[1].name, "sdcard");
+        assert!(listing.entries[1].is_dir);
+        assert_eq!(listing.entries[1].kind, "symlink");
+        let broken = listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == "broken-link")
+            .unwrap();
+        assert!(!broken.is_dir);
+        let file = listing
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "file")
+            .unwrap();
+        assert_eq!(file.path, "/中文 ' $文件.txt");
+        assert_eq!(file.size, 42);
+        assert_eq!(file.modified, 1700000000);
+        assert_eq!(file.permissions, "644");
+        assert_eq!(
+            listing
+                .entries
+                .iter()
+                .find(|entry| entry.name == "pipe")
+                .unwrap()
+                .kind,
+            "other"
+        );
+        assert!(parse_listing("/", b"STFILES3\0DIRS\0")
+            .unwrap()
+            .entries
+            .is_empty());
+    }
+
+    #[test]
+    fn batched_listing_handles_large_native_argv_batches() {
+        let mut output = String::from("STFILES3\0");
+        for (start, count) in [(0, 300), (300, 148)] {
+            output.push_str(&format!("{count}\0"));
+            for index in start..start + count {
+                output.push_str(&format!("./file-{index:04}\0"));
+            }
+            for _ in 0..count {
+                output.push_str("24 1700000000 644 81a4\n");
+            }
+            output.push('\0');
+        }
+        output.push_str("DIRS\0");
+        let listing = parse_listing("/system/bin", output.as_bytes()).unwrap();
+        assert_eq!(listing.entries.len(), 448);
+        assert_eq!(listing.entries[447].path, "/system/bin/file-0447");
+    }
+
+    #[test]
+    fn batched_listing_rejects_truncation_and_unsafe_metadata() {
+        for output in [
+            b"STFILES3\0DIRS".as_slice(),
+            b"STFILES3\0000\0DIRS\0",
+            b"STFILES3\020001\0DIRS\0",
+            b"STFILES3\0001\0./a\0",
+            b"STFILES3\0002\0./a\0./b\0001 2 644 81a4\n\0DIRS\0",
+            b"STFILES3\0001\0./a\0001 2 644 nope\n\0DIRS\0",
+            b"STFILES3\0001\0./a/b\0001 2 644 81a4\n\0DIRS\0",
+            b"STFILES3\0001\0./a\nb\0001 2 644 81a4\n\0DIRS\0",
+            b"STFILES3\0001\0./\xff\0001 2 644 81a4\n\0DIRS\0",
+            b"STFILES3\0001\0./a\0001 2 644 81a4\n\0",
+        ] {
+            assert!(
+                parse_listing("/", output).is_err(),
+                "accepted malformed batched listing"
+            );
+        }
+        assert!(listing_script("/").contains("sh {} +"));
+        assert!(!listing_script("/").contains("$(stat"));
+    }
+
+    #[test]
     fn progress_is_optional_and_bounded() {
         assert_eq!(progress_percent("[ 42%] file"), Some(42));
         assert_eq!(progress_percent("[100%]"), Some(100));
@@ -1133,6 +1359,23 @@ mod tests {
         let error = capture_file_command(&mut command, &closing, |_| Ok(())).unwrap_err();
         setter.join().unwrap();
         assert!(error.contains("关闭"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_command_timeout_is_configurable_for_longer_sync_operations() {
+        assert!(FILE_SYNC_TIMEOUT > FILE_COMMAND_TIMEOUT);
+        let mut command = test_process("Start-Sleep -Seconds 20");
+        let started = Instant::now();
+        let error = capture_file_command_with_timeout(
+            &mut command,
+            &AtomicBool::new(false),
+            Duration::from_millis(150),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.contains("超时"));
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 }

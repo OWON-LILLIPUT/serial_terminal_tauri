@@ -30,10 +30,13 @@ interface FileSession {
   draftPath: string;
   entries: DeviceFileEntry[];
   directories: Map<string, DeviceFileEntry[]>;
+  readAt: Map<string, number>;
+  pendingReads: Map<string, { version: number; promise: Promise<DirectoryListing> }>;
   expanded: Set<string>;
-  treeLoading: Set<string>;
+  treeLoading: Map<string, number>;
   treeErrors: Map<string, string>;
   selected: string;
+  selectedNavigation: "" | "parent";
   loading: boolean;
   busy: boolean;
   request: number;
@@ -43,6 +46,8 @@ interface FileSession {
   treeScroll: number;
   cacheVersion: number;
   lastOnline: boolean;
+  syncing: boolean;
+  viewportHeight: number;
   transfer: TransferProgress | null;
   cancelling: boolean;
 }
@@ -62,6 +67,13 @@ interface FileHooks {
   render(): void;
   online(deviceId: string): boolean;
 }
+interface FileActionTarget { directory: string; entry?: DeviceFileEntry }
+const fileMenuActions = [
+  ["up", "上一级", "E74A"], ["go", "前往", "E8A7"], ["refresh", "刷新", "E72C"],
+  ["upload-file", "上传文件", "E898"], ["upload-directory", "上传目录", "E8B7"],
+  ["download", "下载", "E896"], ["mkdir", "新建目录", "E8F4"],
+  ["rename", "重命名", "E8AC"], ["delete", "删除", "E74D"], ["sync", "同步到硬盘", "E74E"],
+] as const;
 
 export function normalizeDevicePath(path: string): string {
   if (!path.startsWith("/") || /[\x00-\x1f\x7f]/.test(path)) throw new Error("请输入以 / 开头的设备绝对路径");
@@ -88,18 +100,41 @@ function sizeText(size: number): string {
   return `${(size / 1024 ** 3).toFixed(2)} GB`;
 }
 function transferRunning(session: FileSession): boolean { return session.transfer?.phase === "running"; }
+const directoryCacheMs = 30000;
+const fileRowHeight = 32;
+const fileDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "medium" });
+function modifiedText(seconds: number): string {
+  const date = new Date(seconds * 1000);
+  return Number.isFinite(date.getTime()) ? fileDateFormat.format(date) : "—";
+}
 
 export class DeviceFiles {
   private sessions = new Map<string, FileSession>();
   private dialog: FileDialog | null = null;
   private ready: Promise<void>;
   private closing = new Set<string>();
+  private pendingPanels = new Set<string>();
+  private viewportObserver: ResizeObserver | null = null;
+  private contextMenu: HTMLElement | null = null;
   private focus: { id: string; start: number | null; end: number | null } | null = null;
 
   constructor(private hooks: FileHooks) {
     this.ready = listen<TransferProgress>("device-file-transfer", event => this.onProgress(event.payload)).then(() => {});
     // Report listener errors on the file page rather than creating an unhandled rejection.
     void this.ready.catch(() => {});
+    document.addEventListener("pointerdown", event => {
+      if (this.contextMenu && !(event.target instanceof Node && this.contextMenu.contains(event.target))) this.closeContextMenu();
+    });
+    document.addEventListener("keydown", event => {
+      if (!this.contextMenu || !["Escape", "Tab"].includes(event.key)) return;
+      this.closeContextMenu();
+      if (event.key === "Escape") { event.preventDefault(); document.querySelector<HTMLElement>(".device-files-list")?.focus(); }
+    });
+    document.addEventListener("scroll", event => {
+      if (this.contextMenu && !(event.target instanceof Node && this.contextMenu.contains(event.target))) this.closeContextMenu();
+    }, true);
+    window.addEventListener("resize", () => this.closeContextMenu());
+    window.addEventListener("blur", () => this.closeContextMenu());
   }
 
   has(id: string): boolean { return this.sessions.has(id); }
@@ -108,10 +143,10 @@ export class DeviceFiles {
     let session = this.sessions.get(id);
     if (!session) {
       session = {
-        id, deviceId, path: "/", draftPath: "/", entries: [], directories: new Map(),
-        expanded: new Set(["/"]), treeLoading: new Set(), treeErrors: new Map(), selected: "",
+        id, deviceId, path: "/", draftPath: "/", entries: [], directories: new Map(), readAt: new Map(), pendingReads: new Map(),
+        expanded: new Set(["/"]), treeLoading: new Map(), treeErrors: new Map(), selected: "", selectedNavigation: "",
         loading: false, busy: false, request: 0, error: "", message: "", scroll: 0, treeScroll: 0,
-        transfer: null, cancelling: false, cacheVersion: 0, lastOnline: this.hooks.online(deviceId),
+        transfer: null, cancelling: false, cacheVersion: 0, lastOnline: this.hooks.online(deviceId), syncing: false, viewportHeight: 600,
       };
       this.sessions.set(id, session);
       this.hooks.activate(id);
@@ -137,7 +172,7 @@ export class DeviceFiles {
     let changed = false;
     for (const session of this.sessions.values()) {
       const online = this.hooks.online(session.deviceId);
-      if (session.lastOnline !== online) { session.lastOnline = online; changed = true; }
+      if (session.lastOnline !== online) { session.lastOnline = online; session.readAt.clear(); ++session.cacheVersion; changed = true; }
     }
     if (changed) this.hooks.render();
   }
@@ -145,7 +180,10 @@ export class DeviceFiles {
   capture(): void {
     const session = this.sessions.get(this.hooks.activeId());
     if (!session) return;
-    session.scroll = document.querySelector(".device-files-list")?.scrollTop ?? session.scroll;
+    // A completed navigation resets scroll; don't capture the old directory's viewport.
+    const root = document.querySelector<HTMLElement>(".device-files");
+    if (root?.dataset.fileSession !== session.id) { this.focus = null; return; }
+    if (root?.dataset.fileDirectory === session.path) session.scroll = root.querySelector(".device-files-list")?.scrollTop ?? session.scroll;
     session.treeScroll = document.querySelector(".device-files-tree")?.scrollTop ?? session.treeScroll;
     const focused = document.activeElement;
     this.focus = focused instanceof HTMLInputElement && focused.id.startsWith("device-files-")
@@ -156,34 +194,31 @@ export class DeviceFiles {
     const session = this.sessions.get(id);
     if (!session) return "";
     const online = this.hooks.online(session.deviceId);
-    const locked = session.busy || session.loading || transferRunning(session) || !online;
-    const selected = session.entries.find(entry => entry.path === session.selected);
-    const disabled = (condition: boolean) => condition ? "disabled" : "";
-    return `<div class="device-files" data-file-session="${escape(id)}">
+    const disabled = (action: string) => this.actionDisabled(session, action) ? "disabled" : "";
+    return `<div class="device-files" data-file-session="${escape(id)}" data-file-directory="${escape(session.path)}">
       <div class="device-files-toolbar">
-        <button class="secondary-button" data-files-action="up" type="button" title="上一级" ${disabled(session.path === "/" || session.loading)}>↑</button>
+        <button class="secondary-button" data-files-action="up" type="button" title="上一级" ${disabled("up")}>↑</button>
         <form id="device-files-path-form"><input id="device-files-path" class="text-input" aria-label="设备目录路径" value="${escape(session.draftPath)}" />
-          <button class="secondary-button" type="submit" ${disabled(session.loading)}>前往</button></form>
-        <button class="secondary-button" data-files-action="refresh" type="button" ${disabled(session.loading)}>刷新</button>
+          <button class="secondary-button" type="submit" ${disabled("go")}>前往</button></form>
+        <button class="secondary-button" data-files-action="refresh" type="button" ${disabled("refresh")}>刷新</button>
       </div>
       <div class="device-files-actions">
-        <button class="secondary-button" data-files-action="upload-file" type="button" ${disabled(locked)}>上传文件</button>
-        <button class="secondary-button" data-files-action="upload-directory" type="button" ${disabled(locked)}>上传目录</button>
-        <button class="secondary-button" data-files-action="download" type="button" ${disabled(locked || !selected || selected.kind === "other")}>下载</button>
-        <button class="secondary-button" data-files-action="mkdir" type="button" ${disabled(locked)}>新建目录</button>
-        <button class="secondary-button" data-files-action="rename" type="button" ${disabled(locked || !selected)}>重命名</button>
-        <button class="secondary-button danger-button" data-files-action="delete" type="button" ${disabled(locked || !selected)}>删除</button>
+        <button class="secondary-button" data-files-action="upload-file" type="button" ${disabled("upload-file")}>上传文件</button>
+        <button class="secondary-button" data-files-action="upload-directory" type="button" ${disabled("upload-directory")}>上传目录</button>
+        <button class="secondary-button" data-files-action="download" type="button" ${disabled("download")}>下载</button>
+        <button class="secondary-button" data-files-action="mkdir" type="button" ${disabled("mkdir")}>新建目录</button>
+        <button class="secondary-button" data-files-action="rename" type="button" ${disabled("rename")}>重命名</button>
+        <button class="secondary-button danger-button" data-files-action="delete" type="button" ${disabled("delete")}>删除</button>
+        <button class="secondary-button" data-files-action="sync" type="button" title="执行设备端 adb shell sync，将缓存写入设备存储，不是备份到电脑" ${disabled("sync")}>${session.syncing ? "正在同步…" : "同步到硬盘"}</button>
         <span class="device-files-device" title="${escape(session.deviceId)}">${escape(session.deviceId)}</span>
       </div>
       ${!online ? '<div class="device-files-notice">设备未连接或未授权，请重新连接后刷新。此标签仍绑定原设备。</div>' : ""}
       <div class="device-files-body">
         <nav class="device-files-tree" aria-label="设备目录树">${this.renderTree(session, "/", 0, new Set())}</nav>
         <div class="device-files-list" tabindex="0" aria-label="设备文件列表">
-          <table class="device-files-table"><thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th></tr></thead>
-            <tbody>${session.entries.map(entry => `<tr data-file-path="${escape(entry.path)}" class="${entry.path === session.selected ? "selected" : ""}" aria-selected="${entry.path === session.selected}">
-              <td title="${escape(entry.path)}"><span class="device-file-icon ${entry.is_dir ? "folder" : ""}">${entry.is_dir ? "▸" : entry.kind === "symlink" ? "↗" : "▤"}</span>${escape(entry.name)}${entry.kind === "symlink" ? '<span class="device-file-link">链接</span>' : ""}</td>
-              <td>${entry.is_dir ? "—" : sizeText(entry.size)}</td><td>${escape(new Date(entry.modified * 1000).toLocaleString())}</td><td>${escape(entry.permissions)}</td>
-            </tr>`).join("")}</tbody></table>
+          <table class="device-files-table"><colgroup><col class="device-files-name-column"><col class="device-files-size-column"><col class="device-files-modified-column"><col class="device-files-permissions-column"></colgroup>
+            <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th></tr></thead>
+            <tbody>${this.renderRows(session)}</tbody></table>
           ${session.loading ? '<div class="device-files-empty">正在读取目录…</div>' : !session.entries.length && !session.error ? '<div class="device-files-empty">此目录为空</div>' : ""}
         </div>
       </div>
@@ -192,11 +227,36 @@ export class DeviceFiles {
     </div>`;
   }
 
+  private rowRange(session: FileSession): [number, number] {
+    const start = Math.max(0, Math.floor((session.scroll - fileRowHeight) / fileRowHeight) - 8);
+    const count = session.entries.length + 1;
+    return [Math.min(start, count), Math.min(count, start + Math.ceil(session.viewportHeight / fileRowHeight) + 20)];
+  }
+
+  private renderRows(session: FileSession): string {
+    const [start, end] = this.rowRange(session);
+    const spacer = (height: number) => height > 0 ? `<tr class="device-files-spacer" aria-hidden="true"><td colspan="4" style="height:${height}px"></td></tr>` : "";
+    // Navigation rows aren't device entries: never include them in mutations or
+    // the directory tree, and only construct the visible slice for large folders.
+    return spacer(start * fileRowHeight) + Array.from({ length: end - start }, (_, offset) => {
+      const index = start + offset;
+      const navigation = index === 0 ? "parent" : "";
+      const entry: DeviceFileEntry = navigation ? { name: "..", path: parentPath(session.path),
+        kind: "directory", is_dir: true, size: 0, modified: 0, permissions: "—" } : session.entries[index - 1];
+      const selected = entry.path === session.selected && navigation === session.selectedNavigation;
+      const modified = navigation ? "—" : modifiedText(entry.modified);
+      return `<tr data-file-path="${escape(entry.path)}" data-file-navigation="${navigation}" class="${selected ? "selected" : ""}" aria-selected="${selected}">
+        <td title="${escape(entry.path)}"><span class="device-file-icon ${entry.is_dir ? "folder" : ""}">${entry.is_dir ? "▸" : entry.kind === "symlink" ? "↗" : "▤"}</span>${escape(entry.name)}${navigation ? '<span class="device-file-link">上级目录</span>' : entry.kind === "symlink" ? '<span class="device-file-link">链接</span>' : ""}</td>
+        <td>${entry.is_dir ? "—" : sizeText(entry.size)}</td><td title="${escape(modified)}">${escape(modified)}</td><td title="${escape(entry.permissions)}">${escape(entry.permissions)}</td>
+      </tr>`;
+    }).join("") + spacer((session.entries.length + 1 - end) * fileRowHeight);
+  }
+
   private renderTree(session: FileSession, path: string, depth: number, seen: Set<string>): string {
     if (depth > 20 || seen.has(path)) return "";
     const name = path === "/" ? "/ 根目录" : path.slice(path.lastIndexOf("/") + 1);
     const expanded = session.expanded.has(path);
-    const loading = session.treeLoading.has(path);
+    const loading = session.treeLoading.get(path) === session.cacheVersion;
     const children = session.directories.get(path)?.filter(entry => entry.is_dir) ?? [];
     const nextSeen = new Set(seen).add(path);
     return `<div class="device-files-tree-node">
@@ -233,54 +293,96 @@ export class DeviceFiles {
   }
 
   bind(): void {
+    this.closeContextMenu();
     document.querySelectorAll<HTMLElement>("[data-files-tab]").forEach(button => button.addEventListener("click", event => {
       const close = (event.target as Element)?.closest<HTMLElement>("[data-files-close]");
       if (close?.dataset.filesClose) { void this.close(close.dataset.filesClose); return; }
       if (button.dataset.filesTab) this.hooks.activate(button.dataset.filesTab);
     }));
+    this.bindPanel();
+    this.bindDialog();
+    this.restoreFocus();
+  }
+
+  private bindPanel(): void {
+    this.viewportObserver?.disconnect();
+    this.viewportObserver = null;
     const session = this.sessions.get(this.hooks.activeId());
     if (session) {
       const list = document.querySelector<HTMLElement>(".device-files-list");
       const tree = document.querySelector<HTMLElement>(".device-files-tree");
       if (list) list.scrollTop = session.scroll;
       if (tree) tree.scrollTop = session.treeScroll;
+      if (list) session.viewportHeight = list.clientHeight;
+      // The first render may use the previous tab's viewport height. The observer
+      // must reconcile it even when scrollTop itself hasn't changed.
+      let range = "";
+      let scrollQueued = false;
+      const updateViewport = () => {
+        if (!list) return;
+        session.scroll = list.scrollTop;
+        session.viewportHeight = list.clientHeight;
+        if (scrollQueued) return;
+        scrollQueued = true;
+        requestAnimationFrame(() => {
+          scrollQueued = false;
+          if (!list.isConnected || !this.live(session)) return;
+          const next = this.rowRange(session).join(":");
+          if (next === range) return;
+          range = next;
+          const body = list.querySelector("tbody");
+          if (body) body.innerHTML = this.renderRows(session);
+        });
+      };
+      list?.addEventListener("scroll", updateViewport, { passive: true });
+      if (list) { this.viewportObserver = new ResizeObserver(updateViewport); this.viewportObserver.observe(list); }
       document.querySelector("#device-files-path-form")?.addEventListener("submit", event => {
         event.preventDefault();
-        void this.navigate(session, document.querySelector<HTMLInputElement>("#device-files-path")?.value || "/");
+        void this.action(session, "go");
       });
       document.querySelector<HTMLInputElement>("#device-files-path")?.addEventListener("input", event => { session.draftPath = (event.target as HTMLInputElement).value; });
       document.querySelectorAll<HTMLElement>("[data-files-action]").forEach(button => button.addEventListener("click", () => { void this.action(session, button.dataset.filesAction!); }));
-      document.querySelectorAll<HTMLElement>("[data-file-path]").forEach(row => {
-        row.addEventListener("click", () => {
-          session.selected = row.dataset.filePath!;
-          document.querySelectorAll<HTMLElement>("[data-file-path]").forEach(item => {
-            item.classList.toggle("selected", item.dataset.filePath === session.selected);
-            item.setAttribute("aria-selected", String(item.dataset.filePath === session.selected));
-          });
-          const locked = session.busy || session.loading || transferRunning(session) || !this.hooks.online(session.deviceId);
-          const entry = session.entries.find(entry => entry.path === session.selected);
-          for (const action of ["download", "rename", "delete"]) {
-            const button = document.querySelector<HTMLButtonElement>(`[data-files-action="${action}"]`);
-            if (button) button.disabled = locked || !entry || (action === "download" && entry.kind === "other");
-          }
+      list?.addEventListener("click", event => {
+          const row = (event.target as Element)?.closest<HTMLElement>("[data-file-path]");
+          if (!row) return;
+          this.select(session, row.dataset.filePath!, row.dataset.fileNavigation as FileSession["selectedNavigation"]);
           list?.focus();
         });
-        row.addEventListener("dblclick", () => {
-          const entry = session.entries.find(entry => entry.path === row.dataset.filePath);
-          if (entry?.is_dir) void this.navigate(session, entry.path);
+      list?.addEventListener("dblclick", event => {
+          const row = (event.target as Element)?.closest<HTMLElement>("[data-file-path]");
+          if (!row) return;
+          this.select(session, row.dataset.filePath!, row.dataset.fileNavigation as FileSession["selectedNavigation"]);
+          this.openSelectedDirectory(session);
         });
-      });
       list?.addEventListener("keydown", event => {
         if (event.key === "Enter") {
-          const entry = session.entries.find(entry => entry.path === session.selected);
-          if (entry?.is_dir) { event.preventDefault(); void this.navigate(session, entry.path); }
+          event.preventDefault(); this.openSelectedDirectory(session);
         } else if (event.key === "Delete") {
           event.preventDefault(); void this.action(session, "delete");
         }
       });
-      document.querySelectorAll<HTMLElement>("[data-files-directory]").forEach(button => button.addEventListener("click", () => { void this.navigate(session, button.dataset.filesDirectory!); }));
+      document.querySelectorAll<HTMLElement>("[data-files-directory]").forEach(button => button.addEventListener("click", () => { void this.openTreeDirectory(session, button.dataset.filesDirectory!); }));
       document.querySelectorAll<HTMLElement>("[data-files-expand]").forEach(button => button.addEventListener("click", () => { void this.expand(session, button.dataset.filesExpand!); }));
+      document.querySelector(".device-files")?.addEventListener("contextmenu", event => {
+        const mouse = event as MouseEvent;
+        const target = mouse.target as Element;
+        if (target.closest("input, textarea") || this.dialog) return;
+        mouse.preventDefault(); mouse.stopPropagation();
+        const row = target.closest<HTMLElement>("[data-file-path]");
+        const treeRow = target.closest<HTMLElement>(".device-files-tree-row");
+        if (row) this.select(session, row.dataset.filePath!, row.dataset.fileNavigation as FileSession["selectedNavigation"]);
+        else if (target.closest(".device-files-list")) this.select(session, "");
+        const directory = treeRow?.querySelector<HTMLElement>("[data-files-directory]")?.dataset.filesDirectory;
+        const context = directory ? {
+          directory, entry: session.directories.get(parentPath(directory))?.find(entry => entry.path === directory),
+        } : this.actionTarget(session);
+        this.openContextMenu(session, context, mouse.clientX, mouse.clientY);
+        treeRow?.classList.add("context-target");
+      });
     }
+  }
+
+  private bindDialog(): void {
     const form = document.querySelector<HTMLFormElement>("#device-files-dialog");
     if (form) {
       document.querySelector("#device-files-dialog-cancel")?.addEventListener("click", () => { this.dialog = null; this.hooks.render(); });
@@ -292,6 +394,8 @@ export class DeviceFiles {
         const value = document.querySelector<HTMLInputElement>("#device-files-dialog-input")?.value ?? "";
         if (dialog.input != null && !validDeviceName(value)) { dialog.error = "名称不能为空，不能包含 /、控制字符，也不能是 . 或 ..（最多 255 字节）"; this.hooks.render(); return; }
         this.dialog = null;
+        // Local panel redraws must not leave an already accepted modal behind.
+        this.hooks.render();
         dialog.submit(value);
       });
       const input = document.querySelector<HTMLInputElement>("#device-files-dialog-input");
@@ -307,6 +411,9 @@ export class DeviceFiles {
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
       });
     }
+  }
+
+  private restoreFocus(): void {
     if (this.focus) {
       const input = document.getElementById(this.focus.id);
       if (input instanceof HTMLInputElement) {
@@ -318,22 +425,57 @@ export class DeviceFiles {
   }
 
   private update(session: FileSession): void {
-    if (session.id === this.hooks.activeId()) this.hooks.render();
+    if (session.id !== this.hooks.activeId() || this.pendingPanels.has(session.id)) return;
+    this.pendingPanels.add(session.id);
+    requestAnimationFrame(() => {
+      this.pendingPanels.delete(session.id);
+      if (!this.live(session) || session.id !== this.hooks.activeId()) return;
+      const root = document.querySelector<HTMLElement>(".device-files");
+      if (!root?.parentElement || root.dataset.fileSession !== session.id) return;
+      this.closeContextMenu();
+      this.capture();
+      const panel = root.parentElement;
+      panel.innerHTML = this.render(session.id);
+      this.bindPanel();
+      this.restoreFocus();
+    });
   }
   private live(session: FileSession): boolean { return this.sessions.get(session.id) === session; }
 
-  private async navigate(session: FileSession, input: string): Promise<void> {
+  private readDirectory(session: FileSession, path: string, force = false): Promise<DirectoryListing> {
+    const pending = session.pendingReads.get(path);
+    if (pending?.version === session.cacheVersion) return pending.promise;
+    const cached = session.directories.get(path);
+    if (!force && cached && Date.now() - (session.readAt.get(path) ?? 0) < directoryCacheMs) {
+      return Promise.resolve({ path, entries: cached });
+    }
+    const version = session.cacheVersion;
+    const promise = invoke<DirectoryListing>("list_device_directory", { deviceId: session.deviceId, path }).then(result => {
+      if (this.live(session) && version === session.cacheVersion) {
+        session.directories.set(path, result.entries);
+        session.readAt.set(path, Date.now());
+        session.treeErrors.delete(path);
+      }
+      return result;
+    }).finally(() => { if (session.pendingReads.get(path)?.promise === promise) session.pendingReads.delete(path); });
+    session.pendingReads.set(path, { version, promise });
+    return promise;
+  }
+
+  private async navigate(session: FileSession, input: string, force = false): Promise<void> {
     if (session.busy || !this.live(session)) return;
     let path: string;
     try { path = normalizeDevicePath(input); } catch (error) { session.error = message(error); this.update(session); return; }
     const request = ++session.request;
+    const version = session.cacheVersion;
     session.loading = true;
     session.selected = "";
+    session.selectedNavigation = "";
     session.error = "";
     this.update(session);
     try {
-      const result = await invoke<DirectoryListing>("list_device_directory", { deviceId: session.deviceId, path });
-      if (!this.live(session) || request !== session.request) return;
+      const result = await this.readDirectory(session, path, force);
+      if (!this.live(session) || request !== session.request || version !== session.cacheVersion) return;
       session.path = result.path;
       session.draftPath = result.path;
       session.entries = result.entries;
@@ -341,8 +483,9 @@ export class DeviceFiles {
       session.treeErrors.delete(result.path);
       session.expanded.add(result.path);
       session.selected = "";
+      session.selectedNavigation = "";
       session.scroll = 0;
-      session.message = "";
+      if (!session.syncing) session.message = "";
       // Ensure typed deep paths have ancestors in the lazy directory tree.
       let ancestor = parentPath(result.path);
       while (ancestor !== result.path) {
@@ -352,38 +495,121 @@ export class DeviceFiles {
         ancestor = parentPath(ancestor);
       }
     } catch (error) {
-      if (request === session.request) { session.error = message(error); session.draftPath = session.path; session.treeErrors.set(path, session.error); }
+      if (this.live(session) && request === session.request && version === session.cacheVersion) { session.error = message(error); session.draftPath = session.path; session.treeErrors.set(path, session.error); }
     } finally {
       if (request === session.request && this.live(session)) { session.loading = false; this.update(session); }
     }
   }
 
   private async loadTree(session: FileSession, path: string): Promise<void> {
-    if (session.treeLoading.has(path)) return;
-    session.treeLoading.add(path);
     const version = session.cacheVersion;
+    if (session.treeLoading.get(path) === version) return;
+    session.treeLoading.set(path, version);
     this.update(session);
     try {
-      const result = await invoke<DirectoryListing>("list_device_directory", { deviceId: session.deviceId, path });
+      const result = await this.readDirectory(session, path);
       if (!this.live(session) || version !== session.cacheVersion) return;
       session.directories.set(path, result.entries);
       session.treeErrors.delete(path);
-    } catch (error) { session.treeErrors.set(path, message(error)); }
-    finally { session.treeLoading.delete(path); if (this.live(session)) this.update(session); }
+    } catch (error) { if (version === session.cacheVersion) session.treeErrors.set(path, message(error)); }
+    finally { if (session.treeLoading.get(path) === version) session.treeLoading.delete(path); if (this.live(session)) this.update(session); }
   }
   private async expand(session: FileSession, path: string): Promise<void> {
     if (session.expanded.has(path) && !session.treeErrors.has(path)) session.expanded.delete(path);
-    else { session.expanded.add(path); if (!session.directories.has(path) || session.treeErrors.has(path)) await this.loadTree(session, path); }
+    else { session.expanded.add(path); if (!session.directories.has(path) || session.treeErrors.has(path) || Date.now() - (session.readAt.get(path) ?? 0) >= directoryCacheMs) await this.loadTree(session, path); }
     this.update(session);
   }
 
-  private async action(session: FileSession, action: string): Promise<void> {
+  private async openTreeDirectory(session: FileSession, path: string): Promise<void> {
+    if (this.actionDisabled(session, "go")) return;
+    if (session.path === path && session.expanded.has(path) && !session.treeErrors.has(path)) {
+      session.expanded.delete(path);
+      this.update(session);
+    } else await this.navigate(session, path);
+  }
+
+  private openSelectedDirectory(session: FileSession): void {
+    if (this.actionDisabled(session, "go")) return;
+    const entry = session.entries.find(entry => entry.path === session.selected);
+    if (session.selectedNavigation || entry?.is_dir) void this.navigate(session, session.selected);
+  }
+
+  private actionTarget(session: FileSession): FileActionTarget {
+    return { directory: session.path, entry: session.selectedNavigation ? undefined : session.entries.find(entry => entry.path === session.selected) };
+  }
+
+  private actionDisabled(session: FileSession, action: string, target = this.actionTarget(session)): boolean {
+    if (!this.live(session) || !this.hooks.online(session.deviceId) || session.busy || session.loading) return true;
+    if (["up", "go", "refresh"].includes(action)) return action === "up" && target.directory === "/";
+    if (session.syncing || transferRunning(session)) return true;
+    if (["download", "rename", "delete"].includes(action)) return !target.entry || (action === "download" && target.entry.kind === "other");
+    return false;
+  }
+
+  private select(session: FileSession, path: string, navigation: FileSession["selectedNavigation"] = ""): void {
+    session.selected = path;
+    session.selectedNavigation = navigation;
+    document.querySelectorAll<HTMLElement>("[data-file-path]").forEach(row => {
+      const selected = row.dataset.filePath === path && (row.dataset.fileNavigation || "") === navigation;
+      row.classList.toggle("selected", selected);
+      row.setAttribute("aria-selected", String(selected));
+    });
+    for (const action of ["download", "rename", "delete"]) {
+      const button = document.querySelector<HTMLButtonElement>(`[data-files-action="${action}"]`);
+      if (button) button.disabled = this.actionDisabled(session, action);
+    }
+  }
+
+  private closeContextMenu(): void {
+    this.contextMenu?.remove();
+    this.contextMenu = null;
+    document.querySelectorAll(".device-files-tree-row.context-target").forEach(row => row.classList.remove("context-target"));
+  }
+
+  private openContextMenu(session: FileSession, target: FileActionTarget, x: number, y: number): void {
+    this.closeContextMenu();
+    const menu = document.createElement("div");
+    menu.id = "device-files-context-menu";
+    menu.className = "terminal-context-menu device-files-context-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", "设备文件操作");
+    menu.innerHTML = fileMenuActions.map(([action, label, icon]) => `<button type="button" role="menuitem" class="terminal-context-item"
+      data-files-menu-action="${action}" ${this.actionDisabled(session, action, target) ? "disabled" : ""}>
+      <span class="terminal-context-icon" aria-hidden="true">&#x${icon};</span><span>${escape(action === "sync" && session.syncing ? "正在同步…" : label)}</span></button>`).join("");
+    document.body.append(menu);
+    this.contextMenu = menu;
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+    menu.addEventListener("click", event => {
+      const button = (event.target as Element).closest<HTMLButtonElement>("[data-files-menu-action]");
+      if (!button || button.disabled) return;
+      const action = button.dataset.filesMenuAction!;
+      this.closeContextMenu();
+      if (session.id === this.hooks.activeId() && !this.actionDisabled(session, action, target)) void this.action(session, action, target);
+    });
+    menu.addEventListener("contextmenu", event => event.preventDefault());
+    menu.addEventListener("keydown", event => {
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const buttons = [...menu.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+      const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1 : (index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+      buttons[next]?.focus();
+    });
+    menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus({ preventScroll: true });
+  }
+
+  private async action(session: FileSession, action: string, target = this.actionTarget(session)): Promise<void> {
     if (action === "cancel-transfer") { await this.cancel(session); return; }
     if (action === "dismiss-transfer") { session.transfer = null; this.update(session); return; }
-    if (action === "refresh" || action === "up") { await this.navigate(session, action === "up" ? parentPath(session.path) : session.path); return; }
-    if (session.busy || session.loading || transferRunning(session) || !this.hooks.online(session.deviceId)) return;
-    const entry = session.entries.find(entry => entry.path === session.selected);
-    const directory = session.path;
+    if (this.actionDisabled(session, action, target)) return;
+    this.closeContextMenu();
+    if (action === "refresh" || action === "up" || action === "go") {
+      await this.navigate(session, action === "go" ? session.draftPath : action === "up" ? parentPath(target.directory) : target.directory, action === "refresh"); return;
+    }
+    if (action === "sync") { await this.sync(session); return; }
+    const { entry, directory } = target;
     if (action.startsWith("upload-")) { await this.upload(session, action, directory); return; }
     if (action === "download" && entry) { await this.download(session, entry); return; }
     if (action === "mkdir") {
@@ -399,13 +625,26 @@ export class DeviceFiles {
     this.hooks.render();
   }
 
+  private async sync(session: FileSession): Promise<void> {
+    session.syncing = true;
+    session.error = "";
+    session.message = "正在将设备缓存同步到存储…";
+    this.update(session);
+    try {
+      await invoke<void>("sync_device_files", { deviceId: session.deviceId });
+      session.message = "缓存已同步到设备存储";
+    } catch (error) { session.error = `同步失败：${message(error)}`; }
+    finally { session.syncing = false; this.update(session); }
+  }
+
   private async mutate(session: FileSession, action: string, path: string, name: string): Promise<void> {
-    if (!this.live(session) || session.busy || transferRunning(session)) return;
+    if (!this.live(session) || session.busy || session.syncing || transferRunning(session)) return;
     session.busy = true; session.error = "";
     this.update(session);
     try {
       await invoke<void>("mutate_device_file", { deviceId: session.deviceId, action, path, name, confirmed: action === "delete" });
       session.directories.clear();
+      session.readAt.clear();
       ++session.cacheVersion;
       session.treeErrors.clear();
     } catch (error) { session.error = message(error); }
@@ -472,7 +711,7 @@ export class DeviceFiles {
     if (progress.phase !== "running") {
       session.cancelling = false;
       if (this.closing.delete(session.id)) { this.remove(session); return; }
-      if (progress.phase === "completed") { session.directories.clear(); ++session.cacheVersion; void this.navigate(session, session.path); }
+      if (progress.phase === "completed") { session.directories.clear(); session.readAt.clear(); ++session.cacheVersion; void this.navigate(session, session.path); }
       this.update(session);
       return;
     }
@@ -495,7 +734,7 @@ export class DeviceFiles {
   private async close(id: string): Promise<void> {
     const session = this.sessions.get(id);
     if (!session) return;
-    if (session.busy) { session.error = "文件操作进行中，请稍后关闭此标签。"; this.update(session); return; }
+    if (session.busy || session.syncing) { session.error = "文件操作或同步进行中，请稍后关闭此标签。"; this.update(session); return; }
     if (transferRunning(session)) {
       this.dialog = { session, title: "关闭文件标签？", message: "关闭此标签会取消正在进行的传输，已完成的文件操作不会撤销。", input: null, accept: "取消传输并关闭", danger: true, error: "",
         submit: () => { this.closing.add(session.id); void this.cancel(session); } };

@@ -529,16 +529,18 @@ function renderAndroidSections(): string {
           ${adbShellButtonText()}
         </button>
       </div>
-      <button
-        id="adb-root"
-        class="secondary-button full-button"
-        type="button"
-        ${!state.selectedAdbDevice ? "disabled" : ""}
-      >
-        执行 ADB ROOT
-      </button>
-      <button id="device-files-open" class="secondary-button full-button" type="button"
-        ${!canOpenAdbShell() ? "disabled" : ""}>打开设备文件</button>
+      <div class="android-action-row">
+        <button
+          id="adb-root"
+          class="secondary-button full-button"
+          type="button"
+          ${!state.selectedAdbDevice ? "disabled" : ""}
+        >
+          ADB ROOT
+        </button>
+        <button id="device-files-open" class="secondary-button full-button" type="button"
+          ${!canOpenAdbShell() ? "disabled" : ""}>浏览文件</button>
+      </div>
       ${state.androidMessage ? `<div class="helper-text">${escapeHtml(state.androidMessage)}</div>` : ""}
       ${state.androidError ? `<div class="error-text">${escapeHtml(state.androidError)}</div>` : ""}
     </section>

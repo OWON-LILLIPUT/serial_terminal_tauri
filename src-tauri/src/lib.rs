@@ -1582,6 +1582,7 @@ pub fn run() {
             write_adb_shell,
             stop_adb_shell,
             device_files::list_device_directory,
+            device_files::sync_device_files,
             device_files::mutate_device_file,
             device_files::choose_device_local_path,
             device_files::transfer_device_file,
