@@ -481,16 +481,14 @@ export class DeviceFiles {
       session.entries = result.entries;
       session.directories.set(result.path, result.entries);
       session.treeErrors.delete(result.path);
-      session.expanded.add(result.path);
       session.selected = "";
       session.selectedNavigation = "";
       session.scroll = 0;
       if (!session.syncing) session.message = "";
-      // Ensure typed deep paths have ancestors in the lazy directory tree.
+      // Restore visible ancestors after cache invalidation without expanding them.
       let ancestor = parentPath(result.path);
       while (ancestor !== result.path) {
-        session.expanded.add(ancestor);
-        if (!session.directories.has(ancestor)) void this.loadTree(session, ancestor);
+        if (session.expanded.has(ancestor) && !session.directories.has(ancestor)) void this.loadTree(session, ancestor);
         if (ancestor === "/") break;
         ancestor = parentPath(ancestor);
       }
@@ -522,10 +520,9 @@ export class DeviceFiles {
 
   private async openTreeDirectory(session: FileSession, path: string): Promise<void> {
     if (this.actionDisabled(session, "go")) return;
-    if (session.path === path && session.expanded.has(path) && !session.treeErrors.has(path)) {
-      session.expanded.delete(path);
-      this.update(session);
-    } else await this.navigate(session, path);
+    const collapsed = session.expanded.delete(path);
+    if (session.path !== path || session.error || session.treeErrors.has(path)) await this.navigate(session, path);
+    else if (collapsed) this.update(session);
   }
 
   private openSelectedDirectory(session: FileSession): void {
