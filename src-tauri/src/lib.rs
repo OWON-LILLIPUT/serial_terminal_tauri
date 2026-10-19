@@ -19,6 +19,8 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 mod adb_server;
 mod device_files;
 mod file_dialog;
+#[cfg(windows)]
+mod file_drag;
 use adb_server::{AdbServerManager, AdbServerPhase, AdbServerStatus};
 
 #[cfg(windows)]
@@ -1585,6 +1587,8 @@ pub fn run() {
             device_files::sync_device_files,
             device_files::mutate_device_file,
             device_files::choose_device_local_path,
+            device_files::inspect_device_upload_paths,
+            device_files::drag_device_file,
             device_files::transfer_device_file,
             device_files::cancel_device_transfer
         ])

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
 
 export interface DeviceFileEntry {
   name: string;
@@ -13,10 +14,11 @@ export interface DeviceFileEntry {
 
 interface DirectoryListing { path: string; entries: DeviceFileEntry[] }
 interface LocalSelection { path: string; name: string; is_dir: boolean; exists: boolean; size: number }
+interface UploadItem { local: LocalSelection; name: string }
 interface TransferProgress {
   id: string;
   device_id: string;
-  phase: "running" | "completed" | "failed" | "cancelled";
+  phase: "dragging" | "running" | "completed" | "failed" | "cancelled";
   message: string;
   percent: number | null;
   bytes: number;
@@ -36,6 +38,8 @@ interface FileSession {
   treeLoading: Map<string, number>;
   treeErrors: Map<string, string>;
   selected: string;
+  selectedPaths: Set<string>;
+  selectionAnchor: string;
   selectedNavigation: "" | "parent";
   loading: boolean;
   busy: boolean;
@@ -50,6 +54,8 @@ interface FileSession {
   viewportHeight: number;
   transfer: TransferProgress | null;
   cancelling: boolean;
+  batch: { cancelled: boolean } | null;
+  dragging: boolean;
 }
 interface FileDialog {
   session: FileSession;
@@ -60,6 +66,7 @@ interface FileDialog {
   danger: boolean;
   error: string;
   submit: (value: string) => void;
+  uploads?: UploadItem[];
 }
 interface FileHooks {
   activeId(): string;
@@ -67,7 +74,22 @@ interface FileHooks {
   render(): void;
   online(deviceId: string): boolean;
 }
-interface FileActionTarget { directory: string; entry?: DeviceFileEntry }
+interface FileActionTarget { directory: string; entry?: DeviceFileEntry; entries?: DeviceFileEntry[]; multiple?: boolean }
+interface MarqueeSelection {
+  session: FileSession;
+  list: HTMLElement;
+  pointerId: number;
+  startX: number;
+  startY: number;
+  clientX: number;
+  clientY: number;
+  rowTop: number;
+  base: Set<string>;
+  mode: "replace" | "add" | "toggle";
+  active: boolean;
+  overlay: HTMLElement | null;
+  frame: number;
+}
 const fileMenuActions = [
   ["up", "上一级", "E74A"], ["go", "前往", "E8A7"], ["refresh", "刷新", "E72C"],
   ["upload-file", "上传文件", "E898"], ["upload-directory", "上传目录", "E8B7"],
@@ -99,9 +121,10 @@ function sizeText(size: number): string {
   if (size < 1024 ** 3) return `${(size / 1024 ** 2).toFixed(1)} MB`;
   return `${(size / 1024 ** 3).toFixed(2)} GB`;
 }
-function transferRunning(session: FileSession): boolean { return session.transfer?.phase === "running"; }
+function transferRunning(session: FileSession): boolean { return session.dragging || !!session.batch || session.transfer?.phase === "running"; }
 const directoryCacheMs = 30000;
 const fileRowHeight = 32;
+const transferNoticeMs = 3000;
 const fileDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "medium" });
 function modifiedText(seconds: number): string {
   const date = new Date(seconds * 1000);
@@ -116,16 +139,39 @@ export class DeviceFiles {
   private pendingPanels = new Set<string>();
   private viewportObserver: ResizeObserver | null = null;
   private contextMenu: HTMLElement | null = null;
+  private dragCandidate: { session: FileSession; entries: DeviceFileEntry[]; x: number; y: number } | null = null;
+  private pointerSelection: { session: FileSession; path: string; collapse: boolean } | null = null;
+  private marquee: MarqueeSelection | null = null;
+  private suppressSelectionClick = "";
+  private transferTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private dropTarget: { session: FileSession; directory: string } | null = null;
   private focus: { id: string; start: number | null; end: number | null } | null = null;
 
   constructor(private hooks: FileHooks) {
-    this.ready = listen<TransferProgress>("device-file-transfer", event => this.onProgress(event.payload)).then(() => {});
+    this.ready = Promise.all([
+      listen<TransferProgress>("device-file-transfer", event => this.onProgress(event.payload)),
+      getCurrentWebview().onDragDropEvent(event => this.onDragDrop(event.payload)),
+    ]).then(() => {});
     // Report listener errors on the file page rather than creating an unhandled rejection.
     void this.ready.catch(() => {});
     document.addEventListener("pointerdown", event => {
+      this.suppressSelectionClick = "";
       if (this.contextMenu && !(event.target instanceof Node && this.contextMenu.contains(event.target))) this.closeContextMenu();
     });
+    document.addEventListener("pointermove", event => {
+      if (this.marquee) { this.moveMarquee(event); return; }
+      const candidate = this.dragCandidate;
+      if (!candidate) return;
+      if (!(event.buttons & 1)) { this.dragCandidate = null; return; }
+      if (Math.hypot(event.clientX - candidate.x, event.clientY - candidate.y) < 6) return;
+      this.dragCandidate = null;
+      event.preventDefault();
+      void this.dragDownload(candidate.session, candidate.entries);
+    });
+    document.addEventListener("pointerup", event => { if (this.marquee?.pointerId === event.pointerId) this.endMarquee(); this.dragCandidate = null; });
+    document.addEventListener("pointercancel", () => { this.endMarquee(); this.dragCandidate = null; this.pointerSelection = null; });
     document.addEventListener("keydown", event => {
+      if (this.marquee && event.key === "Escape") { this.endMarquee(); event.preventDefault(); return; }
       if (!this.contextMenu || !["Escape", "Tab"].includes(event.key)) return;
       this.closeContextMenu();
       if (event.key === "Escape") { event.preventDefault(); document.querySelector<HTMLElement>(".device-files-list")?.focus(); }
@@ -133,8 +179,8 @@ export class DeviceFiles {
     document.addEventListener("scroll", event => {
       if (this.contextMenu && !(event.target instanceof Node && this.contextMenu.contains(event.target))) this.closeContextMenu();
     }, true);
-    window.addEventListener("resize", () => this.closeContextMenu());
-    window.addEventListener("blur", () => this.closeContextMenu());
+    window.addEventListener("resize", () => { this.endMarquee(); this.closeContextMenu(); });
+    window.addEventListener("blur", () => { this.endMarquee(); this.closeContextMenu(); this.dragCandidate = null; this.clearDropTarget(); });
   }
 
   has(id: string): boolean { return this.sessions.has(id); }
@@ -144,9 +190,9 @@ export class DeviceFiles {
     if (!session) {
       session = {
         id, deviceId, path: "/", draftPath: "/", entries: [], directories: new Map(), readAt: new Map(), pendingReads: new Map(),
-        expanded: new Set(["/"]), treeLoading: new Map(), treeErrors: new Map(), selected: "", selectedNavigation: "",
+        expanded: new Set(["/"]), treeLoading: new Map(), treeErrors: new Map(), selected: "", selectedNavigation: "", selectedPaths: new Set(), selectionAnchor: "",
         loading: false, busy: false, request: 0, error: "", message: "", scroll: 0, treeScroll: 0,
-        transfer: null, cancelling: false, cacheVersion: 0, lastOnline: this.hooks.online(deviceId), syncing: false, viewportHeight: 600,
+        transfer: null, cancelling: false, batch: null, dragging: false, cacheVersion: 0, lastOnline: this.hooks.online(deviceId), syncing: false, viewportHeight: 600,
       };
       this.sessions.set(id, session);
       this.hooks.activate(id);
@@ -215,14 +261,15 @@ export class DeviceFiles {
       ${!online ? '<div class="device-files-notice">设备未连接或未授权，请重新连接后刷新。此标签仍绑定原设备。</div>' : ""}
       <div class="device-files-body">
         <nav class="device-files-tree" aria-label="设备目录树">${this.renderTree(session, "/", 0, new Set())}</nav>
-        <div class="device-files-list" tabindex="0" aria-label="设备文件列表">
+        <div class="device-files-list" tabindex="0" aria-label="设备文件列表" title="空白处按住左键框选；拖入电脑文件上传；拖动普通文件到电脑文件夹或桌面下载">
           <table class="device-files-table"><colgroup><col class="device-files-name-column"><col class="device-files-size-column"><col class="device-files-modified-column"><col class="device-files-permissions-column"></colgroup>
             <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th></tr></thead>
             <tbody>${this.renderRows(session)}</tbody></table>
           ${session.loading ? '<div class="device-files-empty">正在读取目录…</div>' : !session.entries.length && !session.error ? '<div class="device-files-empty">此目录为空</div>' : ""}
+          <div class="device-files-drop-hint" aria-hidden="true">松开上传到当前目录<br><span>先逐个确认文件名称，再开始上传</span></div>
         </div>
       </div>
-      <div class="device-files-footer"><span class="${session.error ? "error-text" : ""}" title="${escape(session.error || session.message || session.path)}">${escape(session.error || session.message || `${session.entries.length} 个项目 · ${session.path}`)}</span></div>
+      <div class="device-files-footer"><span class="${session.error ? "error-text" : ""}" title="${escape(session.error || session.message || session.path)}">${escape(session.error || session.message || `${session.entries.length} 个项目 · ${session.path}`)}</span><span data-files-selection-count>${session.selectedPaths.size > 1 ? `已选 ${session.selectedPaths.size} 项` : ""}</span></div>
       ${this.renderTransfer(session)}
     </div>`;
   }
@@ -243,10 +290,10 @@ export class DeviceFiles {
       const navigation = index === 0 ? "parent" : "";
       const entry: DeviceFileEntry = navigation ? { name: "..", path: parentPath(session.path),
         kind: "directory", is_dir: true, size: 0, modified: 0, permissions: "—" } : session.entries[index - 1];
-      const selected = entry.path === session.selected && navigation === session.selectedNavigation;
+      const selected = navigation ? entry.path === session.selected && navigation === session.selectedNavigation : !session.selectedNavigation && session.selectedPaths.has(entry.path);
       const modified = navigation ? "—" : modifiedText(entry.modified);
       return `<tr data-file-path="${escape(entry.path)}" data-file-navigation="${navigation}" class="${selected ? "selected" : ""}" aria-selected="${selected}">
-        <td title="${escape(entry.path)}"><span class="device-file-icon ${entry.is_dir ? "folder" : ""}">${entry.is_dir ? "▸" : entry.kind === "symlink" ? "↗" : "▤"}</span>${escape(entry.name)}${navigation ? '<span class="device-file-link">上级目录</span>' : entry.kind === "symlink" ? '<span class="device-file-link">链接</span>' : ""}</td>
+        <td title="${escape(entry.path)}"><span class="device-file-name"><span class="device-file-icon ${entry.is_dir ? "folder" : ""}">${entry.is_dir ? "▸" : entry.kind === "symlink" ? "↗" : "▤"}</span>${escape(entry.name)}${navigation ? '<span class="device-file-link">上级目录</span>' : entry.kind === "symlink" ? '<span class="device-file-link">链接</span>' : ""}</span></td>
         <td>${entry.is_dir ? "—" : sizeText(entry.size)}</td><td title="${escape(modified)}">${escape(modified)}</td><td title="${escape(entry.permissions)}">${escape(entry.permissions)}</td>
       </tr>`;
     }).join("") + spacer((session.entries.length + 1 - end) * fileRowHeight);
@@ -271,11 +318,13 @@ export class DeviceFiles {
   private renderTransfer(session: FileSession): string {
     const transfer = session.transfer;
     if (!transfer) return "";
-    const detail = [transfer.percent != null ? `${transfer.percent}%` : "", transfer.bytes ? sizeText(transfer.bytes) : "", `${(transfer.elapsed_ms / 1000).toFixed(0)} 秒`].filter(Boolean).join(" · ");
+    const active = transfer.phase === "running" || transfer.phase === "dragging";
+    const percent = transfer.phase === "completed" ? 100 : transfer.percent == null ? (active && !session.cancelling ? null : 0) : Math.max(0, Math.min(100, transfer.percent));
+    const detail = [transfer.percent != null ? `${transfer.percent}%` : "", transfer.bytes ? sizeText(transfer.bytes) : ""].filter(Boolean).join(" · ");
     return `<div class="device-files-transfer" aria-live="polite">
       <div class="device-files-transfer-text"><span data-files-transfer-message class="${transfer.phase === "failed" ? "error-text" : ""}" title="${escape(transfer.message)}">${escape(transfer.message)}</span><span data-files-transfer-detail>${escape(detail)}</span></div>
-      <progress ${transfer.percent != null ? `value="${transfer.percent}" max="100"` : ""} aria-label="文件传输进度"></progress>
-      ${transfer.phase === "running" ? `<button class="secondary-button" data-files-action="cancel-transfer" type="button" ${session.cancelling ? "disabled" : ""}>${session.cancelling ? "正在取消…" : "取消传输"}</button>` : '<button class="secondary-button" data-files-action="dismiss-transfer" type="button">收起</button>'}
+      ${transfer.phase !== "dragging" ? `<progress ${percent != null ? `value="${percent}" max="100"` : ""} aria-label="文件传输进度"></progress>` : ""}
+      ${transfer.phase === "running" || transfer.phase === "dragging" ? `<button class="secondary-button" data-files-action="cancel-transfer" type="button" ${session.cancelling ? "disabled" : ""}>${session.cancelling ? "正在取消…" : transfer.phase === "dragging" ? "取消拖动" : "取消传输"}</button>` : '<button class="secondary-button" data-files-action="dismiss-transfer" type="button">收起</button>'}
     </div>`;
   }
 
@@ -286,6 +335,10 @@ export class DeviceFiles {
       <div id="device-files-dialog-title" class="device-files-dialog-title">${escape(dialog.title)}</div>
       <div class="device-files-dialog-message">${escape(dialog.message)}</div>
       ${dialog.input != null ? `<input id="device-files-dialog-input" class="text-input" aria-label="名称" value="${escape(dialog.input)}" maxlength="255" autocomplete="off" />` : ""}
+      ${dialog.uploads ? `<div class="device-files-upload-names">${dialog.uploads.map((item, index) => `<label class="device-files-upload-name">
+        <span title="${escape(item.local.path)}">${escape(item.local.name)} · ${sizeText(item.local.size)}</span>
+        <input id="device-files-upload-name-${index}" class="text-input" data-upload-name="${index}" aria-label="文件 ${index + 1} 上传名称" value="${escape(item.name)}" maxlength="255" autocomplete="off" />
+      </label>`).join("")}</div>` : ""}
       ${dialog.error ? `<div class="error-text">${escape(dialog.error)}</div>` : ""}
       <div class="device-files-dialog-actions"><button class="secondary-button" id="device-files-dialog-cancel" type="button">取消</button>
         <button class="secondary-button ${dialog.danger ? "danger-button" : ""}" type="submit">${escape(dialog.accept)}</button></div>
@@ -293,7 +346,11 @@ export class DeviceFiles {
   }
 
   bind(): void {
+    this.endMarquee();
     this.closeContextMenu();
+    this.dragCandidate = null;
+    this.pointerSelection = null;
+    this.clearDropTarget();
     document.querySelectorAll<HTMLElement>("[data-files-tab]").forEach(button => button.addEventListener("click", event => {
       const close = (event.target as Element)?.closest<HTMLElement>("[data-files-close]");
       if (close?.dataset.filesClose) { void this.close(close.dataset.filesClose); return; }
@@ -305,6 +362,7 @@ export class DeviceFiles {
   }
 
   private bindPanel(): void {
+    this.endMarquee();
     this.viewportObserver?.disconnect();
     this.viewportObserver = null;
     const session = this.sessions.get(this.hooks.activeId());
@@ -343,11 +401,39 @@ export class DeviceFiles {
       document.querySelector<HTMLInputElement>("#device-files-path")?.addEventListener("input", event => { session.draftPath = (event.target as HTMLInputElement).value; });
       document.querySelectorAll<HTMLElement>("[data-files-action]").forEach(button => button.addEventListener("click", () => { void this.action(session, button.dataset.filesAction!); }));
       list?.addEventListener("click", event => {
+          if (session.dragging) return;
+          if (this.suppressSelectionClick === session.id) { this.suppressSelectionClick = ""; return; }
           const row = (event.target as Element)?.closest<HTMLElement>("[data-file-path]");
-          if (!row) return;
-          this.select(session, row.dataset.filePath!, row.dataset.fileNavigation as FileSession["selectedNavigation"]);
+          if (!row) { if (!event.ctrlKey && !event.metaKey && !event.shiftKey) this.select(session, ""); return; }
+          const handled = this.pointerSelection;
+          this.pointerSelection = null;
+          if (handled?.session !== session || handled.path !== row.dataset.filePath || handled.collapse) {
+            this.select(session, row.dataset.filePath!, row.dataset.fileNavigation as FileSession["selectedNavigation"], event);
+          }
           list?.focus();
         });
+      list?.addEventListener("pointerdown", event => {
+        if (event.button !== 0 || this.dialog) return;
+        const target = event.target as Element;
+        if (target.closest("thead") || !list || session.loading || session.busy) return;
+        const row = target.closest<HTMLElement>("[data-file-path]");
+        // Once selected, the entire row is a drag handle, including details/whitespace.
+        // Otherwise whitespace can begin a new marquee; Ctrl/Shift preserve that option.
+        const dragSelected = row && !row.dataset.fileNavigation && session.selectedPaths.has(row.dataset.filePath!)
+          && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+        if (!row || (!dragSelected && target.closest("td") && !target.closest(".device-file-name"))) {
+          this.beginMarquee(session, list, event); return;
+        }
+        const path = row.dataset.filePath!;
+        const collapse = !event.ctrlKey && !event.metaKey && !event.shiftKey && session.selectedPaths.size > 1 && session.selectedPaths.has(path);
+        if (!collapse) this.select(session, path, row.dataset.fileNavigation as FileSession["selectedNavigation"], event);
+        this.pointerSelection = { session, path, collapse };
+        if (row.dataset.fileNavigation) return;
+        const entry = session.entries.find(entry => entry.path === row.dataset.filePath);
+        if (!entry || entry.kind !== "file" || entry.is_dir || this.actionDisabled(session, "download", { directory: session.path, entry })) return;
+        if (!session.selectedPaths.has(path)) return;
+        this.dragCandidate = { session, entries: session.entries.filter(entry => session.selectedPaths.has(entry.path)), x: event.clientX, y: event.clientY };
+      });
       list?.addEventListener("dblclick", event => {
           const row = (event.target as Element)?.closest<HTMLElement>("[data-file-path]");
           if (!row) return;
@@ -355,7 +441,13 @@ export class DeviceFiles {
           this.openSelectedDirectory(session);
         });
       list?.addEventListener("keydown", event => {
-        if (event.key === "Enter") {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+          event.preventDefault(); session.selectedPaths = new Set(session.entries.map(entry => entry.path));
+          session.selected = session.entries[session.entries.length - 1]?.path ?? ""; session.selectedNavigation = "";
+          session.selectionAnchor = session.entries[0]?.path ?? ""; this.paintSelection(session);
+        } else if (event.key === "Escape") {
+          event.preventDefault(); this.select(session, "");
+        } else if (event.key === "Enter") {
           event.preventDefault(); this.openSelectedDirectory(session);
         } else if (event.key === "Delete") {
           event.preventDefault(); void this.action(session, "delete");
@@ -370,7 +462,9 @@ export class DeviceFiles {
         mouse.preventDefault(); mouse.stopPropagation();
         const row = target.closest<HTMLElement>("[data-file-path]");
         const treeRow = target.closest<HTMLElement>(".device-files-tree-row");
-        if (row) this.select(session, row.dataset.filePath!, row.dataset.fileNavigation as FileSession["selectedNavigation"]);
+        if (row) {
+          if (!session.selectedPaths.has(row.dataset.filePath!) || row.dataset.fileNavigation) this.select(session, row.dataset.filePath!, row.dataset.fileNavigation as FileSession["selectedNavigation"]);
+        }
         else if (target.closest(".device-files-list")) this.select(session, "");
         const directory = treeRow?.querySelector<HTMLElement>("[data-files-directory]")?.dataset.filesDirectory;
         const context = directory ? {
@@ -391,6 +485,13 @@ export class DeviceFiles {
         event.preventDefault();
         const dialog = this.dialog;
         if (!dialog) return;
+        if (dialog.uploads) {
+          const names = dialog.uploads.map(item => item.name);
+          if (names.some(name => !validDeviceName(name)) || new Set(names).size !== names.length) {
+            dialog.error = "每个名称必须有效且不能重复（不能含 /、控制字符或为 . / ..，最多 255 字节）";
+            this.hooks.render(); return;
+          }
+        }
         const value = document.querySelector<HTMLInputElement>("#device-files-dialog-input")?.value ?? "";
         if (dialog.input != null && !validDeviceName(value)) { dialog.error = "名称不能为空，不能包含 /、控制字符，也不能是 . 或 ..（最多 255 字节）"; this.hooks.render(); return; }
         this.dialog = null;
@@ -399,8 +500,12 @@ export class DeviceFiles {
         dialog.submit(value);
       });
       const input = document.querySelector<HTMLInputElement>("#device-files-dialog-input");
+      form.querySelectorAll<HTMLInputElement>("[data-upload-name]").forEach(field => field.addEventListener("input", () => {
+        const item = this.dialog?.uploads?.[Number(field.dataset.uploadName)];
+        if (item) item.name = field.value;
+      }));
       input?.addEventListener("input", () => { if (this.dialog) this.dialog.input = input.value; });
-      (input ?? form.querySelector<HTMLButtonElement>("#device-files-dialog-cancel"))?.focus();
+      (input ?? form.querySelector<HTMLInputElement>("[data-upload-name]") ?? form.querySelector<HTMLButtonElement>("#device-files-dialog-cancel"))?.focus();
       if (this.focus?.id !== "device-files-dialog-input") input?.select();
       // Keep keyboard focus inside the confirmation rather than reaching device controls behind it.
       form.addEventListener("keydown", event => {
@@ -416,7 +521,7 @@ export class DeviceFiles {
   private restoreFocus(): void {
     if (this.focus) {
       const input = document.getElementById(this.focus.id);
-      if (input instanceof HTMLInputElement) {
+      if (input instanceof HTMLInputElement && (!this.dialog || input.closest("#device-files-dialog"))) {
         input.focus();
         if (this.focus.start != null && this.focus.end != null) input.setSelectionRange(this.focus.start, this.focus.end);
       }
@@ -470,6 +575,7 @@ export class DeviceFiles {
     const version = session.cacheVersion;
     session.loading = true;
     session.selected = "";
+    session.selectedPaths.clear(); session.selectionAnchor = "";
     session.selectedNavigation = "";
     session.error = "";
     this.update(session);
@@ -482,6 +588,7 @@ export class DeviceFiles {
       session.directories.set(result.path, result.entries);
       session.treeErrors.delete(result.path);
       session.selected = "";
+      session.selectedPaths.clear(); session.selectionAnchor = "";
       session.selectedNavigation = "";
       session.scroll = 0;
       if (!session.syncing) session.message = "";
@@ -532,25 +639,143 @@ export class DeviceFiles {
   }
 
   private actionTarget(session: FileSession): FileActionTarget {
-    return { directory: session.path, entry: session.selectedNavigation ? undefined : session.entries.find(entry => entry.path === session.selected) };
+    return { directory: session.path, entry: session.selectedNavigation ? undefined : session.entries.find(entry => entry.path === session.selected),
+      entries: session.selectedNavigation ? [] : session.entries.filter(entry => session.selectedPaths.has(entry.path)), multiple: session.selectedPaths.size > 1 };
   }
 
   private actionDisabled(session: FileSession, action: string, target = this.actionTarget(session)): boolean {
     if (!this.live(session) || !this.hooks.online(session.deviceId) || session.busy || session.loading) return true;
     if (["up", "go", "refresh"].includes(action)) return action === "up" && target.directory === "/";
     if (session.syncing || transferRunning(session)) return true;
-    if (["download", "rename", "delete"].includes(action)) return !target.entry || (action === "download" && target.entry.kind === "other");
+    if (action === "delete") return !(target.entries?.length || target.entry);
+    if (["download", "rename"].includes(action)) return !!target.multiple || !target.entry || (action === "download" && target.entry.kind === "other");
     return false;
   }
 
-  private select(session: FileSession, path: string, navigation: FileSession["selectedNavigation"] = ""): void {
-    session.selected = path;
-    session.selectedNavigation = navigation;
+  private beginMarquee(session: FileSession, list: HTMLElement, event: PointerEvent): void {
+    const rect = list.getBoundingClientRect();
+    if (event.clientX >= rect.left + list.clientWidth || event.clientY >= rect.top + list.clientHeight) return; // Scrollbars aren't selection space.
+    this.endMarquee(); this.dragCandidate = null; this.pointerSelection = null;
+    const body = list.querySelector("tbody");
+    if (!body) return;
+    this.marquee = { session, list, pointerId: event.pointerId,
+      startX: event.clientX - rect.left + list.scrollLeft, startY: event.clientY - rect.top + list.scrollTop,
+      clientX: event.clientX, clientY: event.clientY, rowTop: body.getBoundingClientRect().top - rect.top + list.scrollTop,
+      base: new Set(session.selectedPaths), mode: event.ctrlKey || event.metaKey ? "toggle" : event.shiftKey ? "add" : "replace",
+      active: false, overlay: null, frame: 0 };
+    list.focus({ preventScroll: true });
+  }
+
+  private moveMarquee(event: PointerEvent): void {
+    const marquee = this.marquee;
+    if (!marquee || marquee.pointerId !== event.pointerId) return;
+    if (!(event.buttons & 1)) { this.endMarquee(); return; }
+    if (!marquee.active && Math.hypot(event.clientX - marquee.clientX, event.clientY - marquee.clientY) < 5) return;
+    marquee.clientX = event.clientX; marquee.clientY = event.clientY;
+    if (!marquee.active) {
+      marquee.active = true;
+      marquee.overlay = document.createElement("div");
+      marquee.overlay.className = "device-files-marquee";
+      marquee.overlay.setAttribute("aria-hidden", "true");
+      document.body.append(marquee.overlay);
+      try { marquee.list.setPointerCapture(marquee.pointerId); } catch { /* Synthetic tests don't own native pointers. */ }
+      this.scrollMarquee();
+    }
+    event.preventDefault();
+    this.paintMarquee();
+  }
+
+  private paintMarquee(): void {
+    const marquee = this.marquee;
+    if (!marquee?.active) return;
+    const { list, session } = marquee;
+    const rect = list.getBoundingClientRect();
+    const header = list.querySelector("thead")!.getBoundingClientRect();
+    const x = marquee.clientX - rect.left + list.scrollLeft;
+    const y = marquee.clientY - rect.top + list.scrollTop;
+    const top = Math.min(marquee.startY, y), bottom = Math.max(marquee.startY, y);
+    const left = Math.min(marquee.startX, x), right = Math.max(marquee.startX, x);
+    const tableWidth = list.querySelector("table")!.getBoundingClientRect().width;
+    const first = Math.max(0, Math.floor((top - marquee.rowTop) / fileRowHeight) - 1);
+    const end = Math.min(session.entries.length, Math.ceil((bottom - marquee.rowTop) / fileRowHeight) - 1);
+    const hits = right > 0 && left < tableWidth && bottom > top ? session.entries.slice(first, Math.max(first, end)) : [];
+    const selected = marquee.mode === "replace" ? new Set<string>() : new Set(marquee.base);
+    for (const entry of hits) {
+      if (marquee.mode === "toggle" && marquee.base.has(entry.path)) selected.delete(entry.path);
+      else selected.add(entry.path);
+    }
+    session.selectedPaths = selected; session.selectedNavigation = "";
+    session.selected = [...selected].pop() ?? "";
+    session.selectionAnchor = hits[0]?.path ?? session.selected;
+    this.paintSelection(session);
+    const clipLeft = rect.left, clipRight = rect.left + list.clientWidth;
+    const clipTop = Math.max(rect.top, header.bottom), clipBottom = rect.top + list.clientHeight;
+    const displayLeft = Math.max(clipLeft, Math.min(clipRight, rect.left + left - list.scrollLeft));
+    const displayTop = Math.max(clipTop, Math.min(clipBottom, rect.top + top - list.scrollTop));
+    if (marquee.overlay) Object.assign(marquee.overlay.style, {
+      left: `${displayLeft}px`, top: `${displayTop}px`,
+      width: `${Math.max(0, Math.min(clipRight, rect.left + right - list.scrollLeft) - displayLeft)}px`,
+      height: `${Math.max(0, Math.min(clipBottom, rect.top + bottom - list.scrollTop) - displayTop)}px`,
+    });
+  }
+
+  private scrollMarquee(): void {
+    const marquee = this.marquee;
+    if (!marquee?.active) return;
+    marquee.frame = requestAnimationFrame(() => {
+      if (this.marquee !== marquee) return;
+      if (!marquee.list.isConnected || this.hooks.activeId() !== marquee.session.id || !this.live(marquee.session)) { this.endMarquee(); return; }
+      const { list } = marquee;
+      const rect = list.getBoundingClientRect();
+      const top = list.querySelector("thead")!.getBoundingClientRect().bottom;
+      const speed = (position: number, low: number, high: number) => position < low + 24 ? -Math.min(24, (low + 24 - position) / 2) : position > high - 24 ? Math.min(24, (position - high + 24) / 2) : 0;
+      const beforeX = list.scrollLeft, beforeY = list.scrollTop;
+      list.scrollTop += speed(marquee.clientY, top, rect.top + list.clientHeight);
+      list.scrollLeft += speed(marquee.clientX, rect.left, rect.left + list.clientWidth);
+      if (beforeX !== list.scrollLeft || beforeY !== list.scrollTop) this.paintMarquee();
+      this.scrollMarquee();
+    });
+  }
+
+  private endMarquee(): void {
+    const marquee = this.marquee;
+    if (!marquee) return;
+    this.marquee = null;
+    if (marquee.active) this.suppressSelectionClick = marquee.session.id;
+    cancelAnimationFrame(marquee.frame);
+    marquee.overlay?.remove();
+    if (marquee.list.hasPointerCapture(marquee.pointerId)) marquee.list.releasePointerCapture(marquee.pointerId);
+  }
+
+  private select(session: FileSession, path: string, navigation: FileSession["selectedNavigation"] = "", keys?: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }): void {
+    if (!path || navigation) {
+      session.selected = path; session.selectedNavigation = navigation; session.selectedPaths.clear(); session.selectionAnchor = "";
+    } else {
+      const additive = keys?.ctrlKey || keys?.metaKey;
+      const anchor = session.entries.findIndex(entry => entry.path === session.selectionAnchor);
+      const index = session.entries.findIndex(entry => entry.path === path);
+      if (keys?.shiftKey && anchor >= 0 && index >= 0) {
+        if (!additive) session.selectedPaths.clear();
+        for (const entry of session.entries.slice(Math.min(anchor, index), Math.max(anchor, index) + 1)) session.selectedPaths.add(entry.path);
+      } else {
+        if (!additive) session.selectedPaths.clear();
+        if (additive && session.selectedPaths.has(path)) session.selectedPaths.delete(path); else session.selectedPaths.add(path);
+        session.selectionAnchor = path;
+      }
+      session.selected = session.selectedPaths.has(path) ? path : [...session.selectedPaths].pop() ?? "";
+      session.selectedNavigation = "";
+    }
+    this.paintSelection(session);
+  }
+
+  private paintSelection(session: FileSession): void {
     document.querySelectorAll<HTMLElement>("[data-file-path]").forEach(row => {
-      const selected = row.dataset.filePath === path && (row.dataset.fileNavigation || "") === navigation;
+      const selected = row.dataset.fileNavigation ? row.dataset.filePath === session.selected && row.dataset.fileNavigation === session.selectedNavigation : !session.selectedNavigation && session.selectedPaths.has(row.dataset.filePath!);
       row.classList.toggle("selected", selected);
       row.setAttribute("aria-selected", String(selected));
     });
+    const count = document.querySelector<HTMLElement>("[data-files-selection-count]");
+    if (count) count.textContent = session.selectedPaths.size > 1 ? `已选 ${session.selectedPaths.size} 项` : "";
     for (const action of ["download", "rename", "delete"]) {
       const button = document.querySelector<HTMLButtonElement>(`[data-files-action="${action}"]`);
       if (button) button.disabled = this.actionDisabled(session, action);
@@ -599,7 +824,7 @@ export class DeviceFiles {
 
   private async action(session: FileSession, action: string, target = this.actionTarget(session)): Promise<void> {
     if (action === "cancel-transfer") { await this.cancel(session); return; }
-    if (action === "dismiss-transfer") { session.transfer = null; this.update(session); return; }
+    if (action === "dismiss-transfer") { this.clearTransferTimer(session); session.transfer = null; this.update(session); return; }
     if (this.actionDisabled(session, action, target)) return;
     this.closeContextMenu();
     if (action === "refresh" || action === "up" || action === "go") {
@@ -615,9 +840,15 @@ export class DeviceFiles {
     } else if (action === "rename" && entry) {
       this.dialog = { session, title: "重命名", message: `${session.deviceId}\n${entry.path}`, input: entry.name, accept: "重命名", danger: false, error: "",
         submit: name => { void this.mutate(session, "rename", entry.path, name); } };
-    } else if (action === "delete" && entry) {
-      this.dialog = { session, title: entry.is_dir ? "删除目录" : "删除文件", message: `${session.deviceId}\n${entry.path}\n${entry.is_dir && entry.kind !== "symlink" ? "目录及其内容将被删除。" : ""}此操作不可撤销。`, input: null, accept: "删除", danger: true, error: "",
-        submit: () => { void this.mutate(session, "delete", entry.path, ""); } };
+    } else if (action === "delete") {
+      const entries = (target.entries ?? (entry ? [entry] : [])).map(item => ({ ...item }));
+      if (!entries.length) return;
+      const only = entries.length === 1 ? entries[0] : null;
+      const paths = entries.slice(0, 20).map(item => item.path).join("\n") + (entries.length > 20 ? `\n…另有 ${entries.length - 20} 项` : "");
+      this.dialog = { session, title: only ? only.is_dir ? "删除目录" : "删除文件" : `删除 ${entries.length} 个项目？`,
+        message: `${session.deviceId}\n${paths}\n${entries.some(item => item.is_dir && item.kind !== "symlink") ? "选中目录及其内容将被删除。" : ""}此操作不可撤销。${only ? "" : "\n将依次删除，遇到失败会停止；已删除项目不会恢复。"}`,
+        input: null, accept: only ? "删除" : `删除 ${entries.length} 项`, danger: true, error: "",
+        submit: () => { if (only) void this.mutate(session, "delete", only.path, ""); else void this.deleteEntries(session, entries); } };
     }
     this.hooks.render();
   }
@@ -650,6 +881,32 @@ export class DeviceFiles {
     else this.update(session);
   }
 
+  private async deleteEntries(session: FileSession, entries: DeviceFileEntry[]): Promise<void> {
+    if (this.actionDisabled(session, "delete", { directory: session.path, entries })) return;
+    session.busy = true; session.error = "";
+    let completed = 0;
+    let failure = "";
+    try {
+      for (const entry of entries) {
+        if (!this.live(session)) return;
+        session.message = `正在删除 ${completed + 1}/${entries.length}：${entry.name}`; this.update(session);
+        await invoke<void>("mutate_device_file", { deviceId: session.deviceId, action: "delete", path: entry.path, name: "", confirmed: true });
+        ++completed;
+      }
+    } catch (error) { failure = message(error); }
+    finally { session.busy = false; }
+    if (!this.live(session)) return;
+    session.directories.clear(); session.readAt.clear(); session.treeErrors.clear(); ++session.cacheVersion;
+    await this.navigate(session, session.path);
+    if (failure) {
+      session.error = `已删除 ${completed}/${entries.length} 项，停止于 ${entries[completed].name}：${failure}；剩余 ${entries.length - completed} 项未删除。`;
+      const remaining = new Set(entries.slice(completed).map(entry => entry.path));
+      session.selectedPaths = new Set(session.entries.filter(entry => remaining.has(entry.path)).map(entry => entry.path));
+      session.selected = [...session.selectedPaths][0] ?? ""; session.selectionAnchor = session.selected;
+    } else session.message = `已删除 ${completed} 个项目`;
+    this.update(session);
+  }
+
   private async upload(session: FileSession, mode: string, directory: string): Promise<void> {
     session.busy = true; session.error = ""; this.update(session);
     let local: LocalSelection | null = null;
@@ -670,6 +927,122 @@ export class DeviceFiles {
     } else await this.startTransfer(session, "upload", target, local.path, false);
   }
 
+  private clearDropTarget(): void {
+    this.dropTarget = null;
+    document.querySelector(".device-files-list.drop-active")?.classList.remove("drop-active");
+  }
+
+  private onDragDrop(event: DragDropEvent): void {
+    if (event.type === "leave") { this.clearDropTarget(); return; }
+    const session = this.sessions.get(this.hooks.activeId());
+    const list = document.querySelector<HTMLElement>(".device-files-list");
+    const rect = list?.getBoundingClientRect();
+    const x = event.position.x / window.devicePixelRatio, y = event.position.y / window.devicePixelRatio;
+    const valid = session && rect && x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+      && !this.dialog && !this.actionDisabled(session, "upload-file") && !session.dragging;
+    if (!valid) { this.clearDropTarget(); return; }
+    if (event.type !== "drop") {
+      this.dropTarget = { session, directory: session.path };
+      list?.classList.add("drop-active");
+      return;
+    }
+    const target = this.dropTarget ?? { session, directory: session.path };
+    this.clearDropTarget();
+    if (target.session !== session || target.directory !== session.path) return;
+    void this.prepareDroppedFiles(session, target.directory, event.paths);
+  }
+
+  private async prepareDroppedFiles(session: FileSession, directory: string, paths: string[]): Promise<void> {
+    if (this.dialog || this.actionDisabled(session, "upload-file")) return;
+    session.busy = true; session.error = ""; this.closeContextMenu(); this.update(session);
+    try {
+      const locals = await invoke<LocalSelection[]>("inspect_device_upload_paths", { paths });
+      if (!this.live(session)) return;
+      const items = locals.map(local => ({ local, name: local.name }));
+      this.uploadNamesDialog(session, directory, items);
+    } catch (error) { session.error = message(error); }
+    finally { session.busy = false; this.update(session); }
+  }
+
+  private uploadNamesDialog(session: FileSession, directory: string, items: UploadItem[], error = ""): void {
+    this.dialog = { session, title: `确认上传名称（${items.length} 个文件）`, message: `${session.deviceId}\n上传到：${directory}\n可修改每个文件名称；取消不会上传任何文件。`,
+      input: null, uploads: items, accept: "确认上传", danger: false, error,
+      submit: () => { void this.confirmDroppedFiles(session, directory, items); } };
+    this.hooks.render();
+  }
+
+  private async confirmDroppedFiles(session: FileSession, directory: string, items: UploadItem[]): Promise<void> {
+    if (this.actionDisabled(session, "upload-file")) return;
+    session.busy = true; session.error = ""; this.update(session);
+    try {
+      // Never authorize overwriting from the browse cache.
+      const listing = await invoke<DirectoryListing>("list_device_directory", { deviceId: session.deviceId, path: directory });
+      if (!this.live(session)) return;
+      const existing = new Map(listing.entries.map(entry => [entry.name, entry]));
+      const conflicts = items.filter(item => existing.has(item.name));
+      if (conflicts.some(item => existing.get(item.name)!.kind !== "file")) {
+        this.uploadNamesDialog(session, directory, items, "同名目录或符号链接不能覆盖，请修改对应上传名称。"); return;
+      }
+      const start = () => { void this.uploadBatch(session, directory, items, new Set(conflicts.map(item => item.name))); };
+      if (conflicts.length) {
+        this.dialog = { session, title: "覆盖设备文件？", message: `${session.deviceId}\n${directory}\n以下 ${conflicts.length} 个同名文件将被替换：\n${conflicts.map(item => item.name).join("\n")}\n取消则整批不上传。`,
+          input: null, accept: "覆盖并上传", danger: true, error: "", submit: start };
+        this.hooks.render();
+      } else {
+        session.busy = false;
+        start();
+      }
+    } catch (error) { session.error = message(error); }
+    finally { session.busy = false; this.update(session); }
+  }
+
+  private async uploadBatch(session: FileSession, directory: string, items: UploadItem[], overwrites: Set<string>): Promise<void> {
+    if (this.actionDisabled(session, "upload-file")) return;
+    const batch = { cancelled: false };
+    session.batch = batch;
+    let completed = 0;
+    for (const item of items) {
+      if (batch.cancelled || !this.live(session)) break;
+      session.message = `正在上传 ${completed + 1}/${items.length}：${item.name}`;
+      const target = `${directory === "/" ? "" : directory}/${item.name}`;
+      if (!await this.startTransfer(session, "upload", target, item.local.path, overwrites.has(item.name))) break;
+      ++completed;
+    }
+    session.batch = null;
+    session.cancelling = false;
+    const summary = `${batch.cancelled ? "已取消后续上传" : completed === items.length ? "上传完成" : "上传中止"}：${completed}/${items.length} 个文件`;
+    if (session.transfer) session.transfer = { ...session.transfer, phase: batch.cancelled ? "cancelled" : completed === items.length ? "completed" : "failed", message: `${summary}${session.transfer.phase === "failed" ? `；${session.transfer.message}` : ""}` };
+    this.scheduleTransferDismiss(session);
+    session.message = summary;
+    if (this.closing.delete(session.id)) { this.remove(session); return; }
+    if (completed) {
+      session.directories.clear(); session.readAt.clear(); ++session.cacheVersion;
+      await this.navigate(session, session.path);
+    }
+    this.update(session);
+  }
+
+  private async dragDownload(session: FileSession, entries: DeviceFileEntry[]): Promise<void> {
+    if (this.dialog || !entries.length || this.actionDisabled(session, "download", { directory: session.path, entry: entries[0] })) return;
+    if (entries.length > 256 || entries.some(entry => entry.kind !== "file" || entry.is_dir)) {
+      session.error = "请选择 1–256 个普通文件拖出，目录或符号链接请使用下载按钮。"; this.update(session); return;
+    }
+    this.closeContextMenu(); this.clearDropTarget();
+    const id = crypto.randomUUID();
+    this.clearTransferTimer(session);
+    session.dragging = true; session.error = ""; session.cancelling = false;
+    session.transfer = { id, device_id: session.deviceId, phase: "dragging", message: `拖到电脑文件夹或桌面：${entries.length === 1 ? entries[0].name : `${entries.length} 个文件`}（Esc 取消）`, percent: null, bytes: 0, total: null, elapsed_ms: 0 };
+    this.update(session);
+    try {
+      await this.ready;
+      if (session.cancelling) throw new Error("已取消传输");
+      await invoke<void>("drag_device_file", { id, deviceId: session.deviceId, remotePaths: entries.map(entry => entry.path) });
+      if (session.transfer?.id === id && ["dragging", "running"].includes(session.transfer.phase)) this.onProgress({ ...session.transfer, phase: "completed", percent: 100, message: `已复制到目标文件夹（${entries.length} 个文件）` });
+    } catch (error) {
+      if (session.transfer?.id === id && ["dragging", "running"].includes(session.transfer.phase)) this.onProgress({ ...session.transfer, phase: message(error).startsWith("已取消传输") ? "cancelled" : "failed", message: message(error) });
+    } finally { session.dragging = false; this.update(session); }
+  }
+
   private async download(session: FileSession, entry: DeviceFileEntry): Promise<void> {
     session.busy = true; session.error = ""; this.update(session);
     let local: LocalSelection | null = null;
@@ -685,45 +1058,77 @@ export class DeviceFiles {
     } else await this.startTransfer(session, "download", entry.path, local.path, false);
   }
 
-  private async startTransfer(session: FileSession, direction: string, remotePath: string, localPath: string, overwrite: boolean): Promise<void> {
-    if (!this.live(session) || transferRunning(session)) return;
+  private async startTransfer(session: FileSession, direction: string, remotePath: string, localPath: string, overwrite: boolean): Promise<boolean> {
+    if (!this.live(session) || session.dragging || session.transfer?.phase === "running") return false;
     const id = crypto.randomUUID();
+    this.clearTransferTimer(session);
     session.error = ""; session.cancelling = false;
     session.transfer = { id, device_id: session.deviceId, phase: "running", message: direction === "upload" ? "准备上传…" : "准备下载…", percent: null, bytes: 0, total: null, elapsed_ms: 0 };
     this.update(session);
     try {
       await this.ready;
+      if (session.cancelling || session.batch?.cancelled) throw new Error("已取消传输");
       await invoke<void>("transfer_device_file", { request: { id, device_id: session.deviceId, direction, remote_path: remotePath, local_path: localPath, overwrite } });
       if (session.transfer?.id === id && session.transfer.phase === "running") this.onProgress({ ...session.transfer, phase: "completed", percent: 100, message: "传输完成" });
     } catch (error) {
       if (session.transfer?.id === id && session.transfer.phase === "running") this.onProgress({ ...session.transfer, phase: message(error).startsWith("已取消传输") ? "cancelled" : "failed", message: message(error) });
     }
+    return session.transfer?.id === id && session.transfer.phase === "completed";
   }
 
   private onProgress(progress: TransferProgress): void {
     const session = this.sessions.get(`device-files:${progress.device_id}`);
-    if (!session || session.transfer?.id !== progress.id || session.transfer.phase !== "running") return;
+    if (!session || session.transfer?.id !== progress.id || !["dragging", "running"].includes(session.transfer.phase)) return;
+    if (progress.phase === "dragging" && session.transfer.phase !== "dragging") return;
+    if (session.cancelling && ["dragging", "running"].includes(progress.phase)) {
+      void invoke("cancel_device_transfer", { id: progress.id }).catch(() => {});
+      return; // Freeze the last visible progress while cancellation is being acknowledged.
+    }
+    const enteringTransfer = session.transfer.phase === "dragging" && progress.phase === "running";
     session.transfer = progress;
-    if (session.cancelling && progress.phase === "running") void invoke("cancel_device_transfer", { id: progress.id }).catch(() => {});
-    if (progress.phase !== "running") {
+    if (progress.phase !== "running" && progress.phase !== "dragging") {
       session.cancelling = false;
+      if (session.batch) { this.update(session); return; }
       if (this.closing.delete(session.id)) { this.remove(session); return; }
-      if (progress.phase === "completed") { session.directories.clear(); session.readAt.clear(); ++session.cacheVersion; void this.navigate(session, session.path); }
+      this.scheduleTransferDismiss(session);
+      if (progress.phase === "completed" && !session.dragging) { session.directories.clear(); session.readAt.clear(); ++session.cacheVersion; void this.navigate(session, session.path); }
       this.update(session);
       return;
     }
     // Do not rebuild the app on every progress tick: keep focus, scroll and terminal DOM intact.
+    if (enteringTransfer) this.update(session);
     if (session.id !== this.hooks.activeId()) return;
     const label = document.querySelector<HTMLElement>("[data-files-transfer-message]");
     if (label) { label.textContent = progress.message; label.title = progress.message; }
     const detail = document.querySelector<HTMLElement>("[data-files-transfer-detail]");
-    if (detail) detail.textContent = [progress.percent != null ? `${progress.percent}%` : "", progress.bytes ? sizeText(progress.bytes) : "", `${(progress.elapsed_ms / 1000).toFixed(0)} 秒`].filter(Boolean).join(" · ");
+    if (detail) detail.textContent = [progress.percent != null ? `${progress.percent}%` : "", progress.bytes ? sizeText(progress.bytes) : ""].filter(Boolean).join(" · ");
     const bar = document.querySelector<HTMLProgressElement>(".device-files-transfer progress");
     if (bar) { if (progress.percent == null) bar.removeAttribute("value"); else { bar.max = 100; bar.value = progress.percent; } }
   }
 
+  private clearTransferTimer(session: FileSession): void {
+    const timer = this.transferTimers.get(session.id);
+    if (timer != null) clearTimeout(timer);
+    this.transferTimers.delete(session.id);
+  }
+
+  private scheduleTransferDismiss(session: FileSession): void {
+    this.clearTransferTimer(session);
+    const transfer = session.transfer;
+    if (!transfer || session.batch || ["dragging", "running"].includes(transfer.phase)) return;
+    const timer = setTimeout(() => {
+      if (this.transferTimers.get(session.id) !== timer) return;
+      this.transferTimers.delete(session.id);
+      if (!this.live(session) || session.transfer?.id !== transfer.id || session.batch || ["dragging", "running"].includes(session.transfer.phase)) return;
+      session.transfer = null;
+      this.update(session);
+    }, transferNoticeMs);
+    this.transferTimers.set(session.id, timer);
+  }
+
   private async cancel(session: FileSession): Promise<void> {
     if (!session.transfer || !transferRunning(session)) return;
+    if (session.batch) session.batch.cancelled = true;
     session.cancelling = true; this.update(session);
     try { await invoke<void>("cancel_device_transfer", { id: session.transfer.id }); }
     catch (error) { session.error = message(error); session.cancelling = false; this.update(session); }
@@ -739,6 +1144,8 @@ export class DeviceFiles {
     } else this.remove(session);
   }
   private remove(session: FileSession): void {
+    if (this.marquee?.session === session) this.endMarquee();
+    this.clearTransferTimer(session);
     ++session.request;
     this.sessions.delete(session.id);
     if (this.hooks.activeId() === session.id) this.hooks.activate("serial");

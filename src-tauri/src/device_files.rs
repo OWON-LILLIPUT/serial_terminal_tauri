@@ -616,6 +616,196 @@ pub async fn choose_device_local_path(
     .map_err(|e| e.to_string())?
 }
 
+fn inspect_upload_paths(paths: Vec<String>) -> Result<Vec<LocalSelection>, String> {
+    if paths.is_empty() || paths.len() > 256 {
+        return Err("一次请拖入 1–256 个普通文件".into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .into_iter()
+        .map(|path| {
+            let source = PathBuf::from(&path);
+            if !source.is_absolute() {
+                return Err("上传文件必须是本地绝对路径".into());
+            }
+            let metadata =
+                fs::symlink_metadata(&source).map_err(|e| format!("读取拖入文件失败: {e}"))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err("拖入上传暂只支持普通文件；目录请使用上传目录按钮".into());
+            }
+            let canonical = source.canonicalize().map_err(|e| e.to_string())?;
+            if !seen.insert(canonical) {
+                return Err("同一文件不能重复拖入".into());
+            }
+            let name = source
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or("本地文件名编码无效")?
+                .to_string();
+            Ok(LocalSelection {
+                path,
+                name,
+                is_dir: false,
+                exists: true,
+                size: metadata.len(),
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn inspect_device_upload_paths(
+    paths: Vec<String>,
+) -> Result<Vec<LocalSelection>, String> {
+    tauri::async_runtime::spawn_blocking(move || inspect_upload_paths(paths))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn drag_device_file(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    id: String,
+    device_id: String,
+    remote_paths: Vec<String>,
+) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let _ = (app, window, id, device_id, remote_paths);
+        Err("原生拖出下载目前只支持 Windows".into())
+    }
+    #[cfg(windows)]
+    {
+        use crate::file_drag;
+        if remote_paths.is_empty() || remote_paths.len() > 256 {
+            return Err("一次请拖出 1–256 个普通文件".into());
+        }
+        let remotes: Vec<String> = remote_paths
+            .iter()
+            .map(|path| normalize_path(path))
+            .collect::<Result<_, _>>()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for remote in &remotes {
+            if !seen.insert(remote.clone()) {
+                return Err("不能重复拖出同一文件".into());
+            }
+            let name = remote
+                .rsplit('/')
+                .next()
+                .ok_or("无效的设备文件路径")?
+                .to_string();
+            file_drag::validate_windows_name(&name)?;
+            names.push(name);
+        }
+        let device = self::device_id(&device_id)?;
+        let flag = register_transfer(&app, &id)?;
+        let request = TransferRequest {
+            id: id.clone(),
+            device_id: device,
+            direction: "download".into(),
+            remote_path: remotes[0].clone(),
+            local_path: String::new(),
+            overwrite: false,
+        };
+        let started = Instant::now();
+        let count = remotes.len();
+        let transfer_app = app.clone();
+        let transfer_request = request.clone();
+        let transfer_flag = Arc::clone(&flag);
+        // Different FILECONTENTS indexes may be requested concurrently by Shell.
+        // Serialize ADB pulls while each cached file remains independently readable.
+        let pull_lock = Mutex::new(());
+        let operation = file_drag::DragOperation::new(
+            names,
+            flag,
+            Box::new(move |index| {
+                let _pull = pull_lock.lock().map_err(|_| "下载队列不可用")?;
+                check_cancel(&transfer_flag)?;
+                let payload = Arc::new(file_drag::DragPayload::create()?);
+                let mut item = transfer_request.clone();
+                item.remote_path = remotes[index].clone();
+                item.local_path = payload.path.to_str().ok_or("临时路径编码无效")?.to_string();
+                emit_progress(
+                    &transfer_app,
+                    &item,
+                    "running",
+                    &format!("正在下载 {}/{}：{}", index + 1, count, item.remote_path),
+                    None,
+                    0,
+                    None,
+                    started,
+                );
+                let manager = transfer_app.state::<AndroidManager>();
+                let path = shell_quote(&item.remote_path);
+                run_shell(&transfer_app, &manager, &item.device_id, &format!("[ -f {path} ] && [ ! -d {path} ] && [ ! -L {path} ] || {{ echo '只能拖出普通文件' >&2; exit 1; }}"))?;
+                check_cancel(&transfer_flag)?;
+                transfer_inner(&transfer_app, &manager, &item, &transfer_flag, started)?;
+                if !fs::symlink_metadata(&payload.path)
+                    .map_err(|e| e.to_string())?
+                    .is_file()
+                {
+                    return Err("只能拖出普通文件".into());
+                }
+                Ok(payload)
+            }),
+        );
+        let result = match operation {
+            Err(error) => Err(error),
+            Ok(operation) => {
+                let main_operation = Arc::clone(&operation);
+                let accepted_app = app.clone();
+                let accepted_request = request.clone();
+                match window.run_on_main_thread(move || {
+                    if main_operation.drag().is_ok() {
+                        emit_progress(
+                            &accepted_app,
+                            &accepted_request,
+                            "dragging",
+                            "已投放，等待目标读取文件…",
+                            None,
+                            0,
+                            None,
+                            started,
+                        );
+                    }
+                }) {
+                    Err(error) => Err(error.to_string()),
+                    Ok(()) => tauri::async_runtime::spawn_blocking(move || operation.wait())
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|value| value),
+                }
+            }
+        };
+        let phase = match &result {
+            Ok(_) => "completed",
+            Err(error) if error.starts_with(CANCELLED) => "cancelled",
+            _ => "failed",
+        };
+        let detail = result
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| format!("已复制到目标文件夹（{count} 个文件）"));
+        emit_progress(
+            &app,
+            &request,
+            phase,
+            &detail,
+            if result.is_ok() { Some(100) } else { None },
+            0,
+            None,
+            started,
+        );
+        if let Ok(mut transfers) = app.state::<FileManager>().transfers.lock() {
+            transfers.remove(&id);
+        }
+        result
+    }
+}
+
 #[tauri::command(async)]
 pub fn cancel_device_transfer(manager: State<'_, FileManager>, id: String) -> Result<(), String> {
     if let Some(flag) = manager
@@ -631,27 +821,7 @@ pub fn cancel_device_transfer(manager: State<'_, FileManager>, id: String) -> Re
 
 #[tauri::command]
 pub async fn transfer_device_file(app: AppHandle, request: TransferRequest) -> Result<(), String> {
-    if request.id.len() < 8
-        || request.id.len() > 64
-        || !request
-            .id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return Err("无效的传输 ID".into());
-    }
-    let flag = Arc::new(AtomicBool::new(false));
-    {
-        let manager = app.state::<FileManager>();
-        if manager.closing.load(Ordering::SeqCst) {
-            return Err("软件正在关闭".into());
-        }
-        let mut transfers = manager.transfers.lock().map_err(|_| "传输状态不可用")?;
-        if transfers.contains_key(&request.id) {
-            return Err("传输 ID 重复".into());
-        }
-        transfers.insert(request.id.clone(), Arc::clone(&flag));
-    }
+    let flag = register_transfer(&app, &request.id)?;
     let cleanup_app = app.clone();
     let cleanup_id = request.id.clone();
     let result = run_android_task(app, move |app, manager| {
@@ -683,6 +853,25 @@ pub async fn transfer_device_file(app: AppHandle, request: TransferRequest) -> R
         transfers.remove(&cleanup_id);
     }
     result
+}
+
+fn register_transfer(app: &AppHandle, id: &str) -> Result<Arc<AtomicBool>, String> {
+    if id.len() < 8 || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("无效的传输 ID".into());
+    }
+    let flag = Arc::new(AtomicBool::new(false));
+    {
+        let manager = app.state::<FileManager>();
+        let mut transfers = manager.transfers.lock().map_err(|_| "传输状态不可用")?;
+        if manager.closing.load(Ordering::SeqCst) {
+            return Err("软件正在关闭".into());
+        }
+        if transfers.contains_key(id) {
+            return Err("传输 ID 重复".into());
+        }
+        transfers.insert(id.to_string(), Arc::clone(&flag));
+    }
+    Ok(flag)
 }
 
 fn check_cancel(flag: &AtomicBool) -> Result<(), String> {
@@ -1078,6 +1267,35 @@ fn monitor_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_upload_paths_are_regular_absolute_unique_and_bounded() {
+        let directory = std::env::temp_dir().join(format!(
+            "serial-terminal-drop-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let stage = LocalStage::new(directory).unwrap();
+        let source = stage.path.join("中文 文件.txt");
+        fs::write(&source, b"test").unwrap();
+        let path = source.to_str().unwrap().to_string();
+        let result = inspect_upload_paths(vec![path.clone()]).unwrap();
+        assert_eq!(result[0].name, "中文 文件.txt");
+        assert_eq!(result[0].size, 4);
+        assert!(!result[0].is_dir);
+        assert!(inspect_upload_paths(vec![]).is_err());
+        assert!(inspect_upload_paths(vec![path.clone(); 257]).is_err());
+        assert!(inspect_upload_paths(vec![path.clone(), path]).is_err());
+        assert!(inspect_upload_paths(vec![stage.path.to_str().unwrap().into()]).is_err());
+        assert!(inspect_upload_paths(vec!["relative.txt".into()]).is_err());
+        assert!(
+            inspect_upload_paths(vec![stage.path.join("missing").to_str().unwrap().into()])
+                .is_err()
+        );
+    }
     #[test]
     fn paths_and_mutations_are_guarded() {
         assert_eq!(normalize_path("/sdcard/a/../b//").unwrap(), "/sdcard/b");
