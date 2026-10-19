@@ -5,6 +5,7 @@
 - 在现有 ADB 设备框中选择已连接、已授权的设备，点击「浏览文件」（与「ADB ROOT」并排）。
 - 文件页以右侧标签打开，可同时打开多个设备；标签绑定打开时的设备，之后改变下拉选择不会改变操作目标。
 - 支持懒加载目录树、双击/Enter 进入目录、路径输入、上一级和刷新；显示名称、大小、修改时间和权限。
+- 文件标签激活时，鼠标后退/前进侧键按目录浏览历史切换，并恢复该历史项的列表滚动位置；不是简单跳父目录。每个设备标签独立保存最多 128 项历史，刷新和失败导航不入栈，后退后打开新目录会清除旧前进分支。不展开目录树，不影响串口标签；确认弹窗、忙碌、加载中、设备离线和原生拖动期间不切换。兼容驱动映射为 BrowserBack/BrowserForward 的按键。[侧键标准映射](https://developer.mozilla.org/en-US/docs/Web/API/MouseEvent/button)。
 - 显示点开头的隐藏目录；列表顶部仅保留 `..` 返回上级目录（双击或 Enter），不显示 `.`。`..` 不是可下载、重命名或删除的文件。点击目录树名称在右侧进入该目录，不自动展开左树；若该节点已展开则同时收起。只有点击旁边箭头才展开子目录，路径导航和刷新也不自动展开。
 - 元数据列使用固定列宽，名称占据剩余空间；虚拟列表上下滚动不再因长短文件名改变表头位置。窄窗口可横向滚动，长名称及截断元数据可悬停查看。
 - 目录树和列表中的文件夹箭头更醒目；文件区域右键菜单与终端共用主题样式，包含上一级、前往、刷新、上传文件/目录、下载、新建目录、重命名、删除和同步到硬盘。右键列表项目自动选中，空白处禁用文件级操作；目录树右键以该目录为上传/新建/刷新目标。删除和覆盖仍需确认。
@@ -26,13 +27,14 @@
 ```powershell
 npm run build
 node --experimental-transform-types --test tests/file-selection.test.mjs
+node --experimental-transform-types --test tests/file-history.test.mjs
 cargo test --offline --manifest-path src-tauri/Cargo.toml --lib
 npm run tauri -- build --no-bundle
 ```
 
 独立 EXE 输出为 `src-tauri/target/release/serial_terminal.exe`；同目录放置完整 ADB/scrcpy 工具文件（含其 DLL），或使用系统 PATH 中的工具。
 
-隔离 UI 回归：运行 `npm run dev -- --host 127.0.0.1 --port 1422 --strictPort`，浏览器打开 `http://127.0.0.1:1422/tests/device-files-ui.html`，分别点击「运行隔离回归测试」「运行拖放测试」和「运行框选与进度测试」（每次运行前重新加载页面）。该页面使用 Tauri 官方 `mockIPC`，不会连接真实设备或访问本地真实文件，也不会进入生产构建。纯多选/进度逻辑测试需要支持 TypeScript 类型转换的 Node.js；后端另有真实跨 COM apartment 封送、异步结束与文件流测试，但这些仍不等于资源管理器和实际设备的端到端验收。
+隔离 UI 回归：运行 `npm run dev -- --host 127.0.0.1 --port 1422 --strictPort`，浏览器打开 `http://127.0.0.1:1422/tests/device-files-ui.html`，分别点击「运行隔离回归测试」「运行拖放测试」「运行框选与进度测试」和「运行侧键历史测试」（每次运行前重新加载页面）。该页面使用 Tauri 官方 `mockIPC`，不会连接真实设备或访问本地真实文件，也不会进入生产构建。纯历史/多选/进度逻辑测试需要支持 TypeScript 类型转换的 Node.js；侧键事件为标准 DOM 序列模拟，实际鼠标驱动的 WebView2 事件分发需实机验证。后端另有真实跨 COM apartment 封送、异步结束与文件流测试，但这些仍不等于资源管理器和实际设备的端到端验收。
 
 只读目录性能诊断：`node scripts/benchmark-device-directory.mjs <adb路径> <设备ID> /system/bin`。仅输出数量、耗时和数据大小，不打印/保存文件名，不执行设备写操作。
 

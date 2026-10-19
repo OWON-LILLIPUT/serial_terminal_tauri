@@ -15,6 +15,7 @@ export interface DeviceFileEntry {
 interface DirectoryListing { path: string; entries: DeviceFileEntry[] }
 interface LocalSelection { path: string; name: string; is_dir: boolean; exists: boolean; size: number }
 interface UploadItem { local: LocalSelection; name: string }
+interface DirectoryHistoryEntry { path: string; scroll: number }
 interface TransferProgress {
   id: string;
   device_id: string;
@@ -30,6 +31,8 @@ interface FileSession {
   deviceId: string;
   path: string;
   draftPath: string;
+  history: DirectoryHistoryEntry[];
+  historyIndex: number;
   entries: DeviceFileEntry[];
   directories: Map<string, DeviceFileEntry[]>;
   readAt: Map<string, number>;
@@ -125,6 +128,7 @@ function transferRunning(session: FileSession): boolean { return session.draggin
 const directoryCacheMs = 30000;
 const fileRowHeight = 32;
 const transferNoticeMs = 3000;
+const directoryHistoryLimit = 128;
 const fileDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "short", timeStyle: "medium" });
 function modifiedText(seconds: number): string {
   const date = new Date(seconds * 1000);
@@ -154,6 +158,9 @@ export class DeviceFiles {
     ]).then(() => {});
     // Report listener errors on the file page rather than creating an unhandled rejection.
     void this.ready.catch(() => {});
+    for (const type of ["mousedown", "mouseup", "auxclick"] as const) {
+      document.addEventListener(type, event => this.onHistoryMouse(event), { capture: true });
+    }
     document.addEventListener("pointerdown", event => {
       this.suppressSelectionClick = "";
       if (this.contextMenu && !(event.target instanceof Node && this.contextMenu.contains(event.target))) this.closeContextMenu();
@@ -171,6 +178,12 @@ export class DeviceFiles {
     document.addEventListener("pointerup", event => { if (this.marquee?.pointerId === event.pointerId) this.endMarquee(); this.dragCandidate = null; });
     document.addEventListener("pointercancel", () => { this.endMarquee(); this.dragCandidate = null; this.pointerSelection = null; });
     document.addEventListener("keydown", event => {
+      const session = this.sessions.get(this.hooks.activeId());
+      if (session && ["BrowserBack", "BrowserForward"].includes(event.key)) {
+        event.preventDefault(); event.stopPropagation();
+        if (!event.repeat) void this.travelHistory(session, event.key === "BrowserBack" ? -1 : 1);
+        return;
+      }
       if (this.marquee && event.key === "Escape") { this.endMarquee(); event.preventDefault(); return; }
       if (!this.contextMenu || !["Escape", "Tab"].includes(event.key)) return;
       this.closeContextMenu();
@@ -189,7 +202,7 @@ export class DeviceFiles {
     let session = this.sessions.get(id);
     if (!session) {
       session = {
-        id, deviceId, path: "/", draftPath: "/", entries: [], directories: new Map(), readAt: new Map(), pendingReads: new Map(),
+        id, deviceId, path: "/", draftPath: "/", history: [], historyIndex: -1, entries: [], directories: new Map(), readAt: new Map(), pendingReads: new Map(),
         expanded: new Set(["/"]), treeLoading: new Map(), treeErrors: new Map(), selected: "", selectedNavigation: "", selectedPaths: new Set(), selectionAnchor: "",
         loading: false, busy: false, request: 0, error: "", message: "", scroll: 0, treeScroll: 0,
         transfer: null, cancelling: false, batch: null, dragging: false, cacheVersion: 0, lastOnline: this.hooks.online(deviceId), syncing: false, viewportHeight: 600,
@@ -567,10 +580,56 @@ export class DeviceFiles {
     return promise;
   }
 
-  private async navigate(session: FileSession, input: string, force = false): Promise<void> {
+  private onHistoryMouse(event: MouseEvent): void {
+    if (event.button !== 3 && event.button !== 4) return;
+    const session = this.sessions.get(this.hooks.activeId());
+    if (!session) return;
+    // Suppress the WebView's own page history on every phase, but navigate only once.
+    event.preventDefault(); event.stopPropagation();
+    if (event.type === "mouseup") void this.travelHistory(session, event.button === 3 ? -1 : 1);
+  }
+
+  private async travelHistory(session: FileSession, direction: -1 | 1): Promise<void> {
+    if (this.dialog || session.id !== this.hooks.activeId() || session.dragging || this.actionDisabled(session, "go")) return;
+    const index = session.historyIndex + direction;
+    const target = session.history[index];
+    if (!target) return;
+    this.endMarquee(); this.dragCandidate = null; this.pointerSelection = null;
+    this.closeContextMenu();
+    await this.navigate(session, target.path, false, index);
+  }
+
+  private saveHistoryScroll(session: FileSession): void {
+    const current = session.history[session.historyIndex];
+    if (current?.path !== session.path) return;
+    const root = document.querySelector<HTMLElement>(".device-files");
+    if (session.id === this.hooks.activeId() && root?.dataset.fileSession === session.id && root.dataset.fileDirectory === session.path) {
+      session.scroll = root.querySelector(".device-files-list")?.scrollTop ?? session.scroll;
+    }
+    current.scroll = session.scroll;
+  }
+
+  private commitDirectoryHistory(session: FileSession, path: string, index?: number): number {
+    if (index != null) {
+      if (session.history[index]?.path !== path) throw new Error("目录历史已失效，请重新打开目录");
+      session.historyIndex = index;
+      return session.history[index].scroll;
+    }
+    if (session.history[session.historyIndex]?.path !== path) {
+      session.history.splice(session.historyIndex + 1);
+      session.history.push({ path, scroll: 0 });
+      if (session.history.length > directoryHistoryLimit) session.history.shift();
+      session.historyIndex = session.history.length - 1;
+    }
+    return 0;
+  }
+
+  private async navigate(session: FileSession, input: string, force = false, historyIndex?: number): Promise<void> {
     if (session.busy || !this.live(session)) return;
     let path: string;
     try { path = normalizeDevicePath(input); } catch (error) { session.error = message(error); this.update(session); return; }
+    if (historyIndex != null && session.history[historyIndex]?.path !== path) return;
+    this.saveHistoryScroll(session);
     const request = ++session.request;
     const version = session.cacheVersion;
     session.loading = true;
@@ -582,6 +641,7 @@ export class DeviceFiles {
     try {
       const result = await this.readDirectory(session, path, force);
       if (!this.live(session) || request !== session.request || version !== session.cacheVersion) return;
+      const scroll = this.commitDirectoryHistory(session, result.path, historyIndex);
       session.path = result.path;
       session.draftPath = result.path;
       session.entries = result.entries;
@@ -590,7 +650,7 @@ export class DeviceFiles {
       session.selected = "";
       session.selectedPaths.clear(); session.selectionAnchor = "";
       session.selectedNavigation = "";
-      session.scroll = 0;
+      session.scroll = scroll;
       if (!session.syncing) session.message = "";
       // Restore visible ancestors after cache invalidation without expanding them.
       let ancestor = parentPath(result.path);

@@ -717,3 +717,77 @@ document.querySelector("#run-manager-tests")!.addEventListener("click", async ()
   } catch (error) { result.textContent = `FAIL（框选已过 ${passed} 组）：${String(error)}`; console.error(error); }
   finally { run.disabled = false; }
 });
+
+document.querySelector("#run-history-tests")!.addEventListener("click", async () => {
+  const run = document.querySelector<HTMLButtonElement>("#run-history-tests")!;
+  const result = document.querySelector("#ui-test-result")!;
+  run.disabled = true;
+  let passed = 0;
+  const current = () => document.querySelector<HTMLElement>(".device-files")?.dataset.fileDirectory;
+  const side = (button: number) => {
+    const target = document.querySelector(".device-files-list") ?? document.body;
+    for (const type of ["mousedown", "mouseup", "auxclick"]) {
+      const event = new MouseEvent(type, { button, bubbles: true, cancelable: true });
+      target.dispatchEvent(event); assert(event.defaultPrevented, `${type} prevents WebView default navigation`);
+    }
+  };
+  const arrived = (path: string) => waitFor(() => current() === path && document.querySelector<HTMLButtonElement>(actions("refresh"))?.disabled === false, `side navigation ${path}`);
+  try {
+    await waitFor(() => !document.querySelector<HTMLButtonElement>("#device-files-open")!.disabled, "history devices ready");
+    click("#device-files-open"); await arrived("/");
+    side(3); await delay(30); assert(current() === "/", "back at history start is harmless"); ++passed;
+    await navigate("/sdcard"); await navigate("/system");
+    side(3); await arrived("/sdcard");
+    await delay(30); assert(current() === "/sdcard", "one click sequence moves exactly one entry, not all the way to root");
+    side(4); await arrived("/system"); ++passed;
+    side(3); await arrived("/sdcard");
+    const oldRoot = document.querySelector(".device-files"); click(actions("refresh"));
+    await waitFor(() => document.querySelector(".device-files") !== oldRoot && !document.querySelector<HTMLButtonElement>(actions("refresh"))!.disabled, "history refresh done");
+    side(3); await arrived("/"); side(4); await arrived("/sdcard"); side(4); await arrived("/system"); ++passed;
+    side(3); await arrived("/sdcard"); await navigate("/sdcard/Download");
+    side(4); await delay(30); assert(current() === "/sdcard/Download", "new branch removes old forward target");
+    const deniedInput = document.querySelector<HTMLInputElement>("#device-files-path")!;
+    deniedInput.value = "/cannot-read"; deniedInput.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector<HTMLFormElement>("#device-files-path-form")!.requestSubmit();
+    await waitFor(() => document.querySelector(".device-files-footer .error-text")?.textContent?.includes("Permission denied") === true, "navigation failure shown");
+    side(3); await arrived("/sdcard"); side(4); await arrived("/sdcard/Download"); ++passed;
+    await navigate("/large");
+    const list = document.querySelector<HTMLElement>(".device-files-list")!; list.scrollTop = 32000; list.dispatchEvent(new Event("scroll")); await delay(40);
+    await navigate("/sdcard"); side(3); await arrived("/large");
+    assert(document.querySelector<HTMLElement>(".device-files-list")!.scrollTop === 32000, "Back restores virtualized list scroll");
+    assert(document.querySelector('[data-files-expand="/large"]')?.getAttribute("aria-expanded") === "false", "history doesn't expand tree nodes"); ++passed;
+    click('[data-picker-id="adbDevice"]'); click('[data-picker-value="TEST-B"]'); click("#device-files-open"); await arrived("/");
+    side(3); await delay(30); assert(current() === "/", "new device tab doesn't inherit other device history");
+    click('[data-files-tab="device-files:TEST-A"]'); await arrived("/large"); side(4); await arrived("/sdcard");
+    assert(document.querySelector<HTMLElement>(".device-files")!.dataset.fileSession === "device-files:TEST-A", "history stays bound to file tab despite selected ADB device changing"); ++passed;
+    document.querySelector(".device-files-list")!.dispatchEvent(new KeyboardEvent("keydown", { key: "BrowserBack", bubbles: true, cancelable: true }));
+    await arrived("/large");
+    document.querySelector(".device-files-list")!.dispatchEvent(new KeyboardEvent("keydown", { key: "BrowserForward", bubbles: true, cancelable: true })); await arrived("/sdcard"); ++passed;
+    click(actions("mkdir")); side(3); await delay(30);
+    assert(current() === "/sdcard" && document.querySelector("#device-files-dialog"), "side buttons cannot navigate behind a confirmation modal");
+    click("#device-files-dialog-cancel");
+    deviceAOnline = false; click("#refresh-scrcpy-devices"); await waitFor(() => !!document.querySelector(".device-files-notice"), "offline history guard ready");
+    side(3); await delay(30); assert(current() === "/sdcard", "offline history navigation is blocked");
+    deviceAOnline = true; click("#refresh-scrcpy-devices"); await waitFor(() => !document.querySelector(".device-files-notice"), "online restored"); ++passed;
+    // A completed write explicitly invalidates all browse caches, independently of ADB refresh timing.
+    click(actions("mkdir")); submitName("history-cache-reset");
+    await waitFor(() => !!document.querySelector('[data-file-path="/sdcard/history-cache-reset"]') && !document.querySelector<HTMLButtonElement>(actions("refresh"))!.disabled, "mutation invalidates history browse cache");
+    // Force a cache miss to verify the history cursor is transactional on a missing old folder.
+    const original = deviceA.get("/large")!; deviceA.delete("/large");
+    side(3); await waitFor(() => document.querySelector(".device-files-footer .error-text")?.textContent?.includes("Permission denied") === true, "failed history target reported");
+    assert(current() === "/sdcard", "failed Back leaves current directory unchanged");
+    deviceA.set("/large", original); side(3); await arrived("/large"); side(4); await arrived("/sdcard"); ++passed;
+    await navigate("/system");
+    side(3); await arrived("/sdcard"); // /system is now on the forward side of the cursor.
+    click(actions("mkdir")); submitName("history-loading-reset");
+    await waitFor(() => !!document.querySelector('[data-file-path="/sdcard/history-loading-reset"]') && !document.querySelector<HTMLButtonElement>(actions("refresh"))!.disabled, "loading guard cache invalidation ready");
+    side(4); side(3); await arrived("/system");
+    assert(current() === "/system", "a second side click while the first read is pending doesn't race history"); ++passed;
+    click('[data-terminal-tab-id="serial"]');
+    const ignored = new MouseEvent("mouseup", { button: 3, bubbles: true, cancelable: true }); document.body.dispatchEvent(ignored);
+    assert(!ignored.defaultPrevented && !document.querySelector(".device-files"), "serial tab doesn't consume file history buttons");
+    click('[data-files-tab="device-files:TEST-A"]'); await arrived("/system"); ++passed;
+    result.textContent = `PASS：${passed} 组侧键历史回归；仅模拟设备`;
+  } catch (error) { result.textContent = `FAIL（侧键已过 ${passed} 组）：${String(error)}`; console.error(error); }
+  finally { run.disabled = false; }
+});
