@@ -538,6 +538,12 @@ function renderAndroidSections(): string {
         >
           ADB ROOT
         </button>
+        <button id="adb-remount" class="secondary-button full-button" type="button"
+          title="对当前选中设备执行 adb remount" ${!state.selectedAdbDevice ? "disabled" : ""}>ADB REMOUNT</button>
+      </div>
+      <div class="android-action-row">
+        <button id="adb-sync" class="secondary-button full-button" type="button"
+          title="对当前选中设备执行 adb shell sync，将设备缓存写入存储" ${!state.selectedAdbDevice ? "disabled" : ""}>ADB SYNC</button>
         <button id="device-files-open" class="secondary-button full-button" type="button"
           ${!canOpenAdbShell() ? "disabled" : ""}>浏览文件</button>
       </div>
@@ -917,9 +923,9 @@ function bindAndroidEvents(): void {
     void toggleAdbShell();
   });
 
-  document.querySelector("#adb-root")?.addEventListener("click", () => {
-    executeAdbRoot();
-  });
+  for (const action of ["root", "remount", "sync"] as const) {
+    document.querySelector(`#adb-${action}`)?.addEventListener("click", () => executeAdbDeviceCommand(action));
+  }
   document.querySelector("#device-files-open")?.addEventListener("click", () => {
     if (canOpenAdbShell()) deviceFiles.open(state.selectedAdbDevice);
   });
@@ -1532,14 +1538,14 @@ async function toggleRemoteAdb(): Promise<void> {
   renderApp();
 }
 
-function executeAdbRoot(): void {
+function executeAdbDeviceCommand(action: "root" | "remount" | "sync"): void {
   const deviceId = state.selectedAdbDevice;
   if (!deviceId) {
     return;
   }
 
-  adbRootDeviceId = deviceId;
-  void invoke<void>("adb_root", { deviceId }).catch((error) => {
+  if (action === "root") adbRootDeviceId = deviceId;
+  void invoke<void>(`adb_${action}`, { deviceId }).catch((error) => {
     state.androidError = toMessage(error);
     renderApp();
   });
@@ -1799,9 +1805,9 @@ function updateAndroidControls(): void {
     adbShellOpen.classList.toggle("danger-button", running);
   }
 
-  const adbRoot = document.querySelector<HTMLButtonElement>("#adb-root");
-  if (adbRoot) {
-    adbRoot.disabled = !state.selectedAdbDevice;
+  for (const action of ["root", "remount", "sync"]) {
+    const button = document.querySelector<HTMLButtonElement>(`#adb-${action}`);
+    if (button) button.disabled = !state.selectedAdbDevice;
   }
   const filesOpen = document.querySelector<HTMLButtonElement>("#device-files-open");
   if (filesOpen) filesOpen.disabled = !canOpenAdbShell();

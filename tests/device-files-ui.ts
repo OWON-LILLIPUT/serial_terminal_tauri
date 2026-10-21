@@ -25,6 +25,8 @@ let failNextSync = false;
 let failDrag = false;
 let failNextUpload = false;
 let failDeletePath = "";
+let hideAdbDevices = false;
+let failNextAdbAction = "";
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 localStorage.setItem("serial-terminal-settings-v1", JSON.stringify({ selectedAdbDevice: "TEST-A" }));
 mockWindows("main");
@@ -32,7 +34,13 @@ mockIPC(async (command, args: any = {}) => {
   calls.push({ command, args: structuredClone(args) });
   if (command === "list_fonts") return ["Consolas", "Cascadia Mono"];
   if (command === "list_ports") return ["COM5"];
-  if (command === "list_adb_state") return { devices: ["TEST-A", "TEST-B"].map(id => ({ id, state: id === "TEST-A" && !deviceAOnline ? "offline" : "device", is_remote: false })), scrcpy_devices: [] };
+  if (command === "list_adb_state") return { devices: hideAdbDevices ? [] : ["TEST-A", "TEST-B"].map(id => ({ id, state: id === "TEST-A" && !deviceAOnline ? "offline" : "device", is_remote: false })), scrcpy_devices: [] };
+  if (["adb_root", "adb_remount", "adb_sync"].includes(command)) {
+    const failure = failNextAdbAction; failNextAdbAction = "";
+    await delay(500);
+    if (failure) throw new Error(failure);
+    return null;
+  }
   if (command === "list_scrcpy_devices") return [];
   if (command === "get_adb_server_status") return { phase: "ready", message: "", revision: 1 };
   if (command.includes("is_maximized")) return false;
@@ -162,8 +170,13 @@ document.querySelector("#run-ui-tests")!.addEventListener("click", async () => {
   try {
     await waitFor(() => !document.querySelector<HTMLButtonElement>("#device-files-open")!.disabled, "devices loaded");
     const rootButton = document.querySelector("#adb-root")!.getBoundingClientRect();
+    const remountButton = document.querySelector("#adb-remount")!.getBoundingClientRect();
+    const syncButton = document.querySelector("#adb-sync")!.getBoundingClientRect();
     const filesButton = document.querySelector("#device-files-open")!.getBoundingClientRect();
-    assert(Math.abs(rootButton.top - filesButton.top) < 1 && Math.abs(rootButton.height - filesButton.height) < 1, "ROOT/browser buttons align on same row"); ++passed;
+    assert(Math.abs(rootButton.top - remountButton.top) < 1 && remountButton.left > rootButton.right &&
+      Math.abs(syncButton.top - filesButton.top) < 1 && filesButton.left > syncButton.right && syncButton.top > rootButton.bottom &&
+      [remountButton, syncButton, filesButton].every((rect) => Math.abs(rect.height - rootButton.height) < 1),
+    "ROOT/REMOUNT align above SYNC/browser with equal button heights"); ++passed;
     click("#device-files-open");
     await waitFor(() => !!document.querySelector('[data-file-path="/sdcard"]'), "root listing");
     assert(!document.querySelector("#rx-stat"), "file tab hides serial statistics");
@@ -789,5 +802,55 @@ document.querySelector("#run-history-tests")!.addEventListener("click", async ()
     click('[data-files-tab="device-files:TEST-A"]'); await arrived("/system"); ++passed;
     result.textContent = `PASS：${passed} 组侧键历史回归；仅模拟设备`;
   } catch (error) { result.textContent = `FAIL（侧键已过 ${passed} 组）：${String(error)}`; console.error(error); }
+  finally { run.disabled = false; }
+});
+
+document.querySelector("#run-adb-actions-tests")!.addEventListener("click", async () => {
+  const run = document.querySelector<HTMLButtonElement>("#run-adb-actions-tests")!;
+  const result = document.querySelector("#ui-test-result")!;
+  const commands = (name: string) => calls.filter(call => call.command === `adb_${name}`);
+  const button = (name: string) => document.querySelector<HTMLButtonElement>(`#adb-${name}`)!;
+  run.disabled = true;
+  let passed = 0;
+  try {
+    await waitFor(() => !!button("remount") && !button("remount").disabled && !button("sync").disabled, "sidebar device selection ready");
+    const root = button("root").getBoundingClientRect(), remount = button("remount").getBoundingClientRect(), sync = button("sync").getBoundingClientRect();
+    const files = document.querySelector("#device-files-open")!.getBoundingClientRect();
+    assert(Math.abs(root.top - remount.top) < 1 && remount.left > root.right &&
+      Math.abs(sync.top - files.top) < 1 && files.left > sync.right && sync.top > root.bottom &&
+      [remount, sync, files].every((rect) => Math.abs(rect.height - root.height) < 1),
+    "ROOT/REMOUNT share the first row and SYNC/browser share the second row");
+    for (const action of ["remount", "sync"]) {
+      assert(button(action).classList.contains("secondary-button") && button(action).classList.contains("full-button"), "new actions use shared button theme and global active effect");
+      assert(getComputedStyle(button(action)).backgroundColor === getComputedStyle(button("root")).backgroundColor, "new action background matches ROOT");
+    }
+    ++passed;
+    click("#adb-remount"); click("#adb-remount");
+    assert(commands("remount").length === 2 && commands("remount").every(call => call.args.deviceId === "TEST-A"), "each REMOUNT click sends exactly one request to selected device");
+    assert(!button("remount").disabled, "REMOUNT doesn't lock while IPC is pending"); ++passed;
+    click("#adb-sync"); click("#adb-sync");
+    assert(commands("sync").length === 2 && commands("sync").every(call => call.args.deviceId === "TEST-A"), "each SYNC click sends exactly one request to selected device");
+    assert(!button("sync").disabled && !commands("root").length, "SYNC doesn't lock or implicitly root"); ++passed;
+    click('[data-picker-id="adbDevice"]'); click('[data-picker-value="TEST-B"]');
+    click("#adb-remount"); click("#adb-sync");
+    assert(commands("remount").at(-1)!.args.deviceId === "TEST-B" && commands("sync").at(-1)!.args.deviceId === "TEST-B", "new clicks follow current selector");
+    await delay(600);
+    assert(commands("remount").slice(0, 2).every(call => call.args.deviceId === "TEST-A") && commands("sync").slice(0, 2).every(call => call.args.deviceId === "TEST-A"), "earlier requests remain bound to original device");
+    assert(document.querySelector('[data-picker-id="adbDevice"]')?.getAttribute("title")?.includes("TEST-B"), "command completion doesn't change selection"); ++passed;
+    failNextAdbAction = "simulated executable launch failed";
+    click("#adb-remount");
+    await waitFor(() => button("remount").closest("section")?.querySelector(".error-text")?.textContent?.includes("simulated executable launch failed") === true, "tool/start failure is visible");
+    assert(!button("remount").disabled && !button("sync").disabled, "launch failure doesn't leave controls disabled"); ++passed;
+    hideAdbDevices = true; click("#refresh-scrcpy-devices");
+    await waitFor(() => button("remount").disabled && button("sync").disabled, "no selection disables both actions");
+    const before = commands("remount").length + commands("sync").length;
+    button("remount").click(); button("sync").click();
+    assert(commands("remount").length + commands("sync").length === before, "no selection cannot launch a command"); ++passed;
+    hideAdbDevices = false; click("#refresh-scrcpy-devices");
+    await waitFor(() => !button("remount").disabled && !button("sync").disabled, "restored selection re-enables actions");
+    click("#adb-root");
+    assert(commands("root").length === 1 && commands("root")[0].args.deviceId === "TEST-A" && !button("root").disabled, "ROOT retains single-shot non-blocking behavior"); ++passed;
+    result.textContent = `PASS：${passed} 组侧栏 ADB 回归；未执行真实命令`;
+  } catch (error) { result.textContent = `FAIL（ADB 已过 ${passed} 组）：${String(error)}`; console.error(error); }
   finally { run.disabled = false; }
 });

@@ -406,22 +406,46 @@ fn adb_disconnect_inner(
 
 #[tauri::command]
 async fn adb_root(device_id: String) -> Result<(), String> {
+    start_adb_device_command(device_id, &["root"], "ROOT").await
+}
+
+#[tauri::command]
+async fn adb_remount(device_id: String) -> Result<(), String> {
+    start_adb_device_command(device_id, &["remount"], "REMOUNT").await
+}
+
+#[tauri::command]
+async fn adb_sync(device_id: String) -> Result<(), String> {
+    // This flushes device storage; `adb sync` instead uploads host build files.
+    start_adb_device_command(device_id, &["shell", "sync"], "SYNC").await
+}
+
+fn adb_device_command(adb_path: &Path, device_id: &str, args: &[&str]) -> Command {
+    let mut command = Command::new(adb_path);
+    if let Some(adb_dir) = adb_path.parent() {
+        command.current_dir(adb_dir);
+    }
+    command
+        .args(["-s", device_id])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_command_window(&mut command);
+    command
+}
+
+async fn start_adb_device_command(
+    device_id: String,
+    args: &'static [&'static str],
+    name: &'static str,
+) -> Result<(), String> {
     let device_id = normalize_device_id(&device_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let adb_path = find_tool_path("adb")?;
-        let mut command = Command::new(&adb_path);
-        if let Some(adb_dir) = adb_path.parent() {
-            command.current_dir(adb_dir);
-        }
-        command
-            .args(["-s", &device_id, "root"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        hide_command_window(&mut command);
-        let mut child = command
+        let mut child = adb_device_command(&adb_path, &device_id, args)
             .spawn()
-            .map_err(|error| format!("启动 ADB ROOT 命令失败: {error}"))?;
+            .map_err(|error| format!("启动 ADB {name} 命令失败: {error}"))?;
         // Reap the child in the background without waiting for or interpreting its result.
         thread::spawn(move || {
             let _ = child.wait();
@@ -429,7 +453,7 @@ async fn adb_root(device_id: String) -> Result<(), String> {
         Ok(())
     })
     .await
-    .map_err(|error| format!("执行 ADB ROOT 任务失败: {error}"))?
+    .map_err(|error| format!("执行 ADB {name} 任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -1575,6 +1599,8 @@ pub fn run() {
             adb_connect,
             adb_disconnect,
             adb_root,
+            adb_remount,
+            adb_sync,
             get_adb_server_status,
             list_adb_state,
             list_scrcpy_devices,
@@ -1599,4 +1625,36 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod adb_device_command_tests {
+    use super::*;
+
+    #[test]
+    fn one_shot_commands_target_exact_device_with_literal_arguments() {
+        let tool = Path::new("tools/adb.exe");
+        for device in ["2253005", "192.168.30.139:5555", "device with spaces"] {
+            for args in [&["root"][..], &["remount"][..], &["shell", "sync"][..]] {
+                let command = adb_device_command(tool, device, args);
+                let actual: Vec<_> = command
+                    .get_args()
+                    .map(|arg| arg.to_str().unwrap())
+                    .collect();
+                let expected: Vec<_> = ["-s", device]
+                    .into_iter()
+                    .chain(args.iter().copied())
+                    .collect();
+                assert_eq!(actual, expected);
+                assert_eq!(command.get_program(), tool.as_os_str());
+                assert_eq!(command.get_current_dir(), tool.parent());
+            }
+        }
+    }
+
+    #[test]
+    fn device_selection_is_required_and_trimmed() {
+        assert!(normalize_device_id(" \t").is_err());
+        assert_eq!(normalize_device_id(" 2253005 ").unwrap(), "2253005");
+    }
 }
