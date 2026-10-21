@@ -14,13 +14,15 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 
 mod adb_server;
 mod device_files;
 mod file_dialog;
 #[cfg(windows)]
 mod file_drag;
+#[cfg(test)]
+mod serial_lifecycle_tests;
 use adb_server::{AdbServerManager, AdbServerPhase, AdbServerStatus};
 
 #[cfg(windows)]
@@ -62,14 +64,19 @@ struct SerialManager {
 
 impl Drop for SerialManager {
     fn drop(&mut self) {
-        if let Ok(state) = self.inner.get_mut() {
-            close_locked(state);
-        }
+        let state = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner());
+        state.closing = true;
+        close_locked(state);
     }
 }
 
 #[derive(Default)]
 struct SerialState {
+    closing: bool,
+    generation: u64,
     reader_stop: Option<Arc<AtomicBool>>,
     reader: Option<JoinHandle<()>>,
     writer_stop: Option<Arc<AtomicBool>>,
@@ -266,36 +273,59 @@ fn connect(
 ) -> Result<(), String> {
     validate_serial_config(&config)?;
 
-    {
+    connect_serial_with(
+        &manager,
+        || {
+            #[cfg(windows)]
+            let ports = windows_serial::open_serial_pair(&config);
+
+            #[cfg(not(windows))]
+            let ports = open_serial_pair(&config);
+
+            ports
+        },
+        |state, (reader_port, writer_port)| {
+            let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
+            let writer_stop = Arc::new(AtomicBool::new(false));
+            let reader_stop = Arc::new(AtomicBool::new(false));
+            state.reader_stop = Some(Arc::clone(&reader_stop));
+            state.writer_stop = Some(Arc::clone(&writer_stop));
+            state.writer_tx = Some(writer_tx);
+            state.reader = Some(spawn_reader(app.clone(), reader_port, reader_stop));
+            state.writer = Some(spawn_writer(app, writer_port, writer_rx, writer_stop));
+        },
+    )
+}
+
+fn connect_serial_with<T>(
+    manager: &SerialManager,
+    open: impl FnOnce() -> Result<T, String>,
+    start: impl FnOnce(&mut SerialState, T),
+) -> Result<(), String> {
+    let generation = {
         let mut state = manager
             .inner
             .lock()
             .map_err(|_| "串口状态锁已损坏".to_string())?;
+        if state.closing {
+            return Err("程序正在关闭，不能打开串口".to_string());
+        }
         close_locked(&mut state);
-    }
+        state.generation
+    };
 
-    #[cfg(windows)]
-    let (reader_port, writer_port) = windows_serial::open_serial_pair(&config)?;
-
-    #[cfg(not(windows))]
-    let (reader_port, writer_port) = open_serial_pair(&config)?;
-
-    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
-    let writer_stop = Arc::new(AtomicBool::new(false));
-    let reader_stop = Arc::new(AtomicBool::new(false));
-    let reader_handle = spawn_reader(app.clone(), reader_port, Arc::clone(&reader_stop));
-    let writer_handle = spawn_writer(app, writer_port, writer_rx, Arc::clone(&writer_stop));
-
+    // Opening a driver may be slow. Do not hold the state lock, but reject a
+    // late result if disconnect, shutdown, or another connect superseded it.
+    let ports = open()?;
     let mut state = manager
         .inner
         .lock()
         .map_err(|_| "串口状态锁已损坏".to_string())?;
-    state.reader_stop = Some(reader_stop);
-    state.reader = Some(reader_handle);
-    state.writer_stop = Some(writer_stop);
-    state.writer_tx = Some(writer_tx);
-    state.writer = Some(writer_handle);
-
+    if state.closing || state.generation != generation {
+        return Err("串口连接已取消".to_string());
+    }
+    // Start and register the workers atomically with respect to cleanup.
+    start(&mut state, ports);
     Ok(())
 }
 
@@ -858,9 +888,26 @@ fn emit_adb_shell_data(app: &AppHandle, device_id: &str, shell_id: u64, bytes: &
     );
 }
 
+trait SerialReaderPort: Send + 'static {
+    fn read_serial(&mut self, buffer: &mut [u8], stop: &AtomicBool) -> std::io::Result<usize>;
+}
+
+impl SerialReaderPort for Box<dyn SerialPort> {
+    fn read_serial(&mut self, buffer: &mut [u8], _stop: &AtomicBool) -> std::io::Result<usize> {
+        self.read(buffer)
+    }
+}
+
+#[cfg(windows)]
+impl SerialReaderPort for windows_serial::WindowsSerialPort {
+    fn read_serial(&mut self, buffer: &mut [u8], stop: &AtomicBool) -> std::io::Result<usize> {
+        self.read(buffer, stop)
+    }
+}
+
 fn spawn_reader<R>(app: AppHandle, mut port: R, reader_stop: Arc<AtomicBool>) -> JoinHandle<()>
 where
-    R: Read + Send + 'static,
+    R: SerialReaderPort,
 {
     thread::spawn(move || {
         let mut buffer = [0_u8; SERIAL_READ_BUFFER_SIZE];
@@ -868,7 +915,7 @@ where
         let mut last_emit = Instant::now();
 
         while !reader_stop.load(Ordering::Relaxed) {
-            match port.read(&mut buffer) {
+            match port.read_serial(&mut buffer, &reader_stop) {
                 Ok(0) => {}
                 Ok(byte_count) => {
                     pending.extend_from_slice(&buffer[..byte_count]);
@@ -884,6 +931,12 @@ where
                         emit_serial_data(&app, &mut pending);
                         last_emit = Instant::now();
                     }
+                }
+                Err(error)
+                    if reader_stop.load(Ordering::Relaxed)
+                        && error.kind() == ErrorKind::Interrupted =>
+                {
+                    break
                 }
                 Err(error) => {
                     if !pending.is_empty() {
@@ -933,6 +986,10 @@ where
             let Ok(mut bytes) = writer_rx.recv() else {
                 break;
             };
+
+            if writer_stop.load(Ordering::Relaxed) {
+                break;
+            }
 
             if bytes.is_empty() {
                 continue;
@@ -1013,6 +1070,7 @@ fn emit_serial_data(app: &AppHandle, pending: &mut Vec<u8>) {
 }
 
 fn close_locked(state: &mut SerialState) {
+    state.generation = state.generation.wrapping_add(1);
     if let Some(reader_stop) = state.reader_stop.take() {
         reader_stop.store(true, Ordering::Relaxed);
     }
@@ -1021,7 +1079,10 @@ fn close_locked(state: &mut SerialState) {
         writer_stop.store(true, Ordering::Relaxed);
     }
 
-    state.writer_tx.take();
+    if let Some(writer_tx) = state.writer_tx.take() {
+        // Wake recv even if an in-flight write_text still holds a sender clone.
+        let _ = writer_tx.send(Vec::new());
+    }
 
     if let Some(writer) = state.writer.take() {
         let _ = writer.join();
@@ -1553,6 +1614,15 @@ fn close_serial_manager(manager: &SerialManager) -> Result<(), String> {
     Ok(())
 }
 
+fn shutdown_serial_manager(manager: &SerialManager) {
+    let mut state = manager
+        .inner
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    state.closing = true;
+    close_locked(&mut state);
+}
+
 fn close_android_manager(manager: &AndroidManager) {
     if let Ok(mut processes) = manager.scrcpy_processes.lock() {
         stop_all_scrcpy_locked(&mut processes);
@@ -1563,14 +1633,14 @@ fn close_android_manager(manager: &AndroidManager) {
 }
 
 fn cleanup_runtime_resources(serial_manager: &SerialManager, android_manager: &AndroidManager) {
-    let _ = close_serial_manager(serial_manager);
+    shutdown_serial_manager(serial_manager);
     close_android_manager(android_manager);
 }
 
-fn cleanup_window_resources(window: &tauri::Window) {
-    window.state::<device_files::FileManager>().shutdown();
-    let serial_manager = window.state::<SerialManager>();
-    let android_manager = window.state::<AndroidManager>();
+fn cleanup_app_resources(app: &AppHandle) {
+    app.state::<device_files::FileManager>().shutdown();
+    let serial_manager = app.state::<SerialManager>();
+    let android_manager = app.state::<AndroidManager>();
     cleanup_runtime_resources(&serial_manager, &android_manager);
 }
 
@@ -1619,12 +1689,20 @@ pub fn run() {
             device_files::cancel_device_transfer
         ])
         .on_window_event(|window, event| {
-            if matches!(event, WindowEvent::CloseRequested { .. }) {
-                cleanup_window_resources(window);
+            if matches!(
+                event,
+                WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+            ) {
+                cleanup_app_resources(window.app_handle());
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
+                cleanup_app_resources(app);
+            }
+        });
 }
 
 #[cfg(test)]

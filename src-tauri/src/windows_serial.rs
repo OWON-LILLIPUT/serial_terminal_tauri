@@ -95,7 +95,7 @@ impl WindowsSerialPort {
                 process,
                 &mut handle,
                 0,
-                TRUE,
+                FALSE,
                 DUPLICATE_SAME_ACCESS,
             )
         };
@@ -119,10 +119,11 @@ impl WindowsSerialPort {
         Ok(Self { handle, event })
     }
 
-    fn read_once(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+    pub fn read(&mut self, buffer: &mut [u8], stop: &AtomicBool) -> io::Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
         }
+        check_stopped(stop)?;
 
         let mut overlapped = self.prepare_overlapped()?;
         let started = unsafe {
@@ -142,7 +143,7 @@ impl WindowsSerialPort {
             }
         }
 
-        let transferred = self.wait_for_completion(&mut overlapped, None)?;
+        let transferred = self.wait_for_completion(&mut overlapped, stop)?;
         if transferred == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -154,6 +155,7 @@ impl WindowsSerialPort {
     }
 
     fn write_once(&mut self, bytes: &[u8], stop: &AtomicBool) -> io::Result<usize> {
+        check_stopped(stop)?;
         let write_len = bytes.len().min(u32::MAX as usize);
         let mut overlapped = self.prepare_overlapped()?;
         let started = unsafe {
@@ -173,7 +175,7 @@ impl WindowsSerialPort {
             }
         }
 
-        self.wait_for_completion(&mut overlapped, Some(stop))
+        self.wait_for_completion(&mut overlapped, stop)
     }
 
     fn prepare_overlapped(&self) -> io::Result<OVERLAPPED> {
@@ -189,18 +191,18 @@ impl WindowsSerialPort {
     fn wait_for_completion(
         &self,
         overlapped: &mut OVERLAPPED,
-        stop: Option<&AtomicBool>,
+        stop: &AtomicBool,
     ) -> io::Result<usize> {
         if let Some(transferred) = self.try_finish(overlapped)? {
             return Ok(transferred);
         }
 
         loop {
-            if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            if stop.load(Ordering::Relaxed) {
                 self.cancel_and_wait(overlapped);
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
-                    "serial write cancelled",
+                    "serial operation cancelled",
                 ));
             }
 
@@ -249,12 +251,6 @@ impl WindowsSerialPort {
     }
 }
 
-impl io::Read for WindowsSerialPort {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.read_once(buffer)
-    }
-}
-
 impl Drop for WindowsSerialPort {
     fn drop(&mut self) {
         unsafe {
@@ -270,6 +266,16 @@ pub fn open_serial_pair(
     let writer = WindowsSerialPort::open(config)?;
     let reader = writer.duplicate()?;
     Ok((reader, writer))
+}
+
+fn check_stopped(stop: &AtomicBool) -> io::Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "serial operation cancelled",
+        ));
+    }
+    Ok(())
 }
 
 fn configure_port(handle: HANDLE, config: &SerialConfig) -> Result<(), String> {
@@ -361,4 +367,52 @@ fn last_io_error() -> io::Error {
 
 fn error_from_code(code: u32) -> io::Error {
     io::Error::from_raw_os_error(code as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{
+        GetHandleInformation, SetHandleInformation, HANDLE_FLAG_INHERIT,
+    };
+
+    // Event handles exercise ownership/inheritance without opening real hardware.
+    fn event_port() -> WindowsSerialPort {
+        let handle = unsafe { CreateEventW(ptr::null_mut(), TRUE, FALSE, ptr::null()) };
+        assert_ne!(handle, 0);
+        WindowsSerialPort::from_handle(handle).unwrap()
+    }
+
+    #[test]
+    fn duplicate_handle_cannot_be_inherited_by_adb_or_scrcpy() {
+        let original = event_port();
+        assert_ne!(
+            unsafe {
+                SetHandleInformation(original.handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+            },
+            0
+        );
+        let duplicate = original.duplicate().unwrap();
+        let mut flags = 0;
+        assert_ne!(
+            unsafe { GetHandleInformation(duplicate.handle, &mut flags) },
+            0
+        );
+        assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+    }
+
+    #[test]
+    fn stopped_reads_and_writes_do_not_start_more_io() {
+        let mut port = event_port();
+        let stop = AtomicBool::new(true);
+        let mut buffer = [0_u8; 16];
+        assert_eq!(
+            port.read(&mut buffer, &stop).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            port.write_all(b"pending", &stop).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
 }

@@ -18,6 +18,9 @@
 - 用户反馈窗口拉伸时终端区域与窗口边框之间会出现黑色区域，拉伸变大后黑色区域周期性变大/消失。
 
 ## 研究发现
+- 阶段 34 完成：新增串口连接代次与 closing 标志，打开结果注册前复查；读写停止后回收线程，writer 空包唤醒避免在途 sender 让 recv 等待，Windows 重叠读写均检查停止并 CancelIoEx。CloseRequested、Destroyed、ExitRequested/Exit 共用幂等清理，Drop/关闭可恢复中毒状态锁，保留 Android/文件传输原有清理。39 项后端、15 项前端逻辑及类型/格式/编译检查通过；测试未操作实际串口，未打包 EXE。
+- 阶段 34 确认：串口 reader 句柄 DuplicateHandle 使用 TRUE（可继承）；reader 等待不检查停止标志。关闭流程已有 join，但仅绑定 CloseRequested，缺少应用 ExitRequested/Exit 及 Destroyed 兜底。将打开与登记用代次检查隔离，退出时设置永久关闭标志，读写都支持停止，并保证清理可重复调用。
+- 阶段 34 初查：已有窗口 CloseRequested 调用 close_serial_manager，SerialManager::drop 也调用 close_locked；connect 在释放状态锁后打开串口并启动线程，随后再注册句柄，需核对退出/断开期间的竞态。Windows reader 的重叠读取当前未传停止标志，DuplicateHandle 的继承参数为 TRUE，继续确认清理完整性。
 - 当前 Tauri 版前端终端是自研文本渲染，天然缺少完整 ANSI、IME、宽字符、滚动缓冲、选择和 resize 语义。
 - Rust 后端串口桥接已能编译通过，问题主要集中在前端终端核心与交互完整度。
 - xterm.js 已成功通过 TypeScript/Vite 构建并进入 Tauri dev 运行态。
