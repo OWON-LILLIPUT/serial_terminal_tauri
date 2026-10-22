@@ -140,7 +140,7 @@ fn mutable_path(path: &str) -> Result<String, String> {
     Ok(path)
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -617,8 +617,60 @@ pub async fn choose_device_local_path(
 }
 
 fn inspect_upload_paths(paths: Vec<String>) -> Result<Vec<LocalSelection>, String> {
+    inspect_upload_items(paths, false)
+}
+
+fn upload_is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    metadata.file_type().is_symlink()
+}
+
+fn validate_upload_tree(root: &Path, flag: Option<&AtomicBool>) -> Result<(), String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0;
+    while let Some(path) = pending.pop() {
+        if let Some(flag) = flag {
+            check_cancel(flag)?;
+        }
+        visited += 1;
+        if visited > 100000 {
+            return Err("上传目录项目超过 100000，请分批选择子目录".into());
+        }
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|error| format!("读取上传目录失败: {error}"))?;
+        if upload_is_link(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
+            return Err("上传目录包含链接、重解析点或特殊文件，不能安全上传".into());
+        }
+        if metadata.is_dir() {
+            for entry in
+                fs::read_dir(&path).map_err(|error| format!("读取上传目录失败: {error}"))?
+            {
+                pending.push(entry.map_err(|error| error.to_string())?.path());
+                if pending.len() + visited > 100000 {
+                    return Err("上传目录项目超过 100000，请分批选择子目录".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_upload_items(
+    paths: Vec<String>,
+    allow_directories: bool,
+) -> Result<Vec<LocalSelection>, String> {
     if paths.is_empty() || paths.len() > 256 {
-        return Err("一次请拖入 1–256 个普通文件".into());
+        return Err(if allow_directories {
+            "一次请粘贴 1–256 个文件或文件夹".into()
+        } else {
+            "一次请拖入 1–256 个普通文件".into()
+        });
     }
     let mut seen = std::collections::HashSet::new();
     paths
@@ -630,12 +682,21 @@ fn inspect_upload_paths(paths: Vec<String>) -> Result<Vec<LocalSelection>, Strin
             }
             let metadata =
                 fs::symlink_metadata(&source).map_err(|e| format!("读取拖入文件失败: {e}"))?;
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err("拖入上传暂只支持普通文件；目录请使用上传目录按钮".into());
+            if upload_is_link(&metadata)
+                || (!metadata.is_file() && !(allow_directories && metadata.is_dir()))
+            {
+                return Err(if allow_directories {
+                    "只能粘贴普通文件或文件夹，不支持链接、重解析点和特殊文件".into()
+                } else {
+                    "拖入上传暂只支持普通文件；目录请使用上传目录按钮".into()
+                });
+            }
+            if metadata.is_dir() {
+                validate_upload_tree(&source, None)?;
             }
             let canonical = source.canonicalize().map_err(|e| e.to_string())?;
             if !seen.insert(canonical) {
-                return Err("同一文件不能重复拖入".into());
+                return Err("同一文件或文件夹不能重复上传".into());
             }
             let name = source
                 .file_name()
@@ -645,7 +706,7 @@ fn inspect_upload_paths(paths: Vec<String>) -> Result<Vec<LocalSelection>, Strin
             Ok(LocalSelection {
                 path,
                 name,
-                is_dir: false,
+                is_dir: metadata.is_dir(),
                 exists: true,
                 size: metadata.len(),
             })
@@ -656,10 +717,212 @@ fn inspect_upload_paths(paths: Vec<String>) -> Result<Vec<LocalSelection>, Strin
 #[tauri::command]
 pub async fn inspect_device_upload_paths(
     paths: Vec<String>,
+    allow_directories: Option<bool>,
 ) -> Result<Vec<LocalSelection>, String> {
-    tauri::async_runtime::spawn_blocking(move || inspect_upload_paths(paths))
+    tauri::async_runtime::spawn_blocking(move || {
+        if allow_directories.unwrap_or(false) {
+            inspect_upload_items(paths, true)
+        } else {
+            inspect_upload_paths(paths)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn read_device_clipboard_files() -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    return tauri::async_runtime::spawn_blocking(crate::file_clipboard::read_paths)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?;
+    #[cfg(not(windows))]
+    Err("文件剪贴板目前只支持 Windows".into())
+}
+
+#[cfg(windows)]
+struct ClipboardLease {
+    app: AppHandle,
+    id: String,
+    device: String,
+    flag: Arc<AtomicBool>,
+}
+#[cfg(windows)]
+impl ClipboardLease {
+    fn notice(&self, message: &str, error: bool) {
+        let _ = self.app.emit(
+            "device-file-clipboard",
+            serde_json::json!({
+                "id": self.id, "device_id": self.device, "message": message, "error": error,
+            }),
+        );
+    }
+}
+#[cfg(windows)]
+impl Drop for ClipboardLease {
+    fn drop(&mut self) {
+        self.flag.store(true, Ordering::SeqCst);
+        if let Ok(mut transfers) = self.app.state::<FileManager>().transfers.lock() {
+            transfers.remove(&self.id);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clipboard_paths(remote_paths: Vec<String>) -> Result<(Vec<String>, Vec<String>), String> {
+    if remote_paths.is_empty() || remote_paths.len() > 256 {
+        return Err("一次请选择 1–256 个文件或文件夹复制".into());
+    }
+    let mut paths = Vec::new();
+    let mut names = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for path in remote_paths {
+        let path = normalize_path(&path)?;
+        let name = path
+            .rsplit('/')
+            .next()
+            .ok_or("无效的设备文件路径")?
+            .to_string();
+        crate::file_drag::validate_windows_name(&name)?;
+        if !seen.insert(name.to_lowercase()) {
+            return Err("复制的文件存在 Windows 同名冲突，请先重命名".into());
+        }
+        paths.push(path);
+        names.push(name);
+    }
+    Ok((paths, names))
+}
+
+#[tauri::command]
+pub async fn copy_device_files(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    id: String,
+    device_id: String,
+    remote_paths: Vec<String>,
+    remote_directories: Option<Vec<String>>,
+) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let _ = (app, window, id, device_id, remote_paths, remote_directories);
+        Err("文件剪贴板目前只支持 Windows".into())
+    }
+    #[cfg(windows)]
+    {
+        let (remotes, names) = clipboard_paths(remote_paths)?;
+        let directories: std::collections::HashSet<String> = remote_directories
+            .unwrap_or_default()
+            .iter()
+            .map(|path| normalize_path(path))
+            .collect::<Result<_, _>>()?;
+        if directories.iter().any(|path| !remotes.contains(path)) {
+            return Err("复制目录不在当前选择中".into());
+        }
+        let device = self::device_id(&device_id)?;
+        let flag = register_transfer(&app, &id)?;
+        let lease = Arc::new(ClipboardLease {
+            app: app.clone(),
+            id: id.clone(),
+            device: device.clone(),
+            flag: Arc::clone(&flag),
+        });
+        let notify = Arc::clone(&lease);
+        let manifest_lease = Arc::clone(&lease);
+        let manifest = tauri::async_runtime::spawn_blocking(
+            move || -> Result<Vec<crate::clipboard_tree::Entry>, String> {
+                let mut entries = Vec::new();
+                for (remote, name) in remotes.into_iter().zip(names) {
+                    check_cancel(&manifest_lease.flag)?;
+                    if directories.contains(&remote) {
+                        let manager = manifest_lease.app.state::<AndroidManager>();
+                        let output = run_shell(
+                            &manifest_lease.app,
+                            &manager,
+                            &manifest_lease.device,
+                            &crate::clipboard_tree::script(&remote),
+                        )?;
+                        entries.extend(crate::clipboard_tree::parse(&remote, &name, &output)?);
+                    } else {
+                        entries.push(crate::clipboard_tree::Entry {
+                            remote,
+                            name,
+                            is_dir: false,
+                        });
+                    }
+                    if entries.len() > crate::clipboard_tree::MAX_ITEMS {
+                        return Err("复制目录最多包含 10000 个项目，请分批选择".into());
+                    }
+                }
+                Ok(entries)
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())??;
+        let count = manifest.len();
+        let virtual_entries = manifest
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.is_dir))
+            .collect();
+        let pull_lock = Mutex::new(());
+        let operation = crate::file_drag::DragOperation::for_clipboard_tree(
+            virtual_entries,
+            flag,
+            Box::new(move |index| {
+                let _pull = pull_lock.lock().map_err(|_| "下载队列不可用")?;
+                check_cancel(&lease.flag)?;
+                lease.notice(
+                    &format!(
+                        "正在读取设备文件 {}/{}；电脑粘贴完成前请保持软件运行。",
+                        index + 1,
+                        count
+                    ),
+                    false,
+                );
+                let payload = Arc::new(crate::file_drag::DragPayload::create()?);
+                let item = TransferRequest {
+                    id: id.clone(),
+                    device_id: device.clone(),
+                    direction: "download".into(),
+                    remote_path: manifest[index].remote.clone(),
+                    local_path: payload.path.to_str().ok_or("临时路径编码无效")?.into(),
+                    overwrite: false,
+                };
+                let manager = lease.app.state::<AndroidManager>();
+                let path = shell_quote(&item.remote_path);
+                run_shell(&lease.app, &manager, &device, &format!("[ -f {path} ] && [ ! -d {path} ] && [ ! -L {path} ] || {{ echo '只能复制普通文件' >&2; exit 1; }}"))?;
+                check_cancel(&lease.flag)?;
+                transfer_inner(&lease.app, &manager, &item, &lease.flag, Instant::now())?;
+                if !fs::symlink_metadata(&payload.path)
+                    .map_err(|error| error.to_string())?
+                    .is_file()
+                {
+                    return Err("只能复制普通文件".into());
+                }
+                lease.notice(
+                    "设备文件内容已准备；电脑粘贴结果以 Windows 复制窗口提示为准。",
+                    false,
+                );
+                Ok(payload)
+            }),
+            Box::new(move |message, error| notify.notice(message, error)),
+        )?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        window
+            .run_on_main_thread(move || {
+                let result = if app.state::<FileManager>().closing.load(Ordering::SeqCst) {
+                    Err("软件正在关闭".into())
+                } else {
+                    crate::file_clipboard::publish(operation)
+                };
+                let _ = tx.send(result);
+            })
+            .map_err(|error| error.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            rx.recv().map_err(|_| "文件剪贴板任务已取消".to_string())?
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
 }
 
 #[tauri::command]
@@ -909,8 +1172,11 @@ fn transfer_inner(
     if request.direction == "upload" {
         let metadata =
             fs::symlink_metadata(&local).map_err(|e| format!("读取上传文件失败: {e}"))?;
-        if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+        if upload_is_link(&metadata) || (!metadata.is_file() && !metadata.is_dir()) {
             return Err("只支持上传普通文件或目录".into());
+        }
+        if metadata.is_dir() {
+            validate_upload_tree(&local, Some(flag))?;
         }
         let parent = remote
             .rsplit_once('/')
@@ -1296,6 +1562,67 @@ mod tests {
                 .is_err()
         );
     }
+    #[cfg(windows)]
+    #[test]
+    fn clipboard_paths_reject_windows_collisions_and_invalid_selections() {
+        assert_eq!(
+            clipboard_paths(vec![
+                "/sdcard/a/../中文.txt".into(),
+                "/sdcard/other.bin".into()
+            ])
+            .unwrap(),
+            (
+                vec![
+                    "/sdcard/中文.txt".to_string(),
+                    "/sdcard/other.bin".to_string()
+                ],
+                vec!["中文.txt".to_string(), "other.bin".to_string()]
+            )
+        );
+        for paths in [
+            vec![],
+            vec!["/".into()],
+            vec!["relative.txt".into()],
+            vec!["/sdcard/CON".into()],
+            vec!["/sdcard/A.txt".into(), "/sdcard/a.txt".into()],
+            vec!["/sdcard/a".into(); 257],
+        ] {
+            assert!(clipboard_paths(paths).is_err());
+        }
+    }
+
+    #[test]
+    fn clipboard_upload_accepts_mixed_files_directories_and_empty_directories() {
+        let stage = LocalStage::new(std::env::temp_dir().join(format!(
+            "st-folder-upload-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )))
+        .unwrap();
+        let folder = stage.path.join("project");
+        fs::create_dir_all(folder.join("nested").join("empty")).unwrap();
+        fs::write(folder.join("nested").join("中文.txt"), b"nested").unwrap();
+        let file = stage.path.join("plain.bin");
+        fs::write(&file, b"data").unwrap();
+        let paths = vec![
+            folder.to_str().unwrap().to_string(),
+            file.to_str().unwrap().to_string(),
+        ];
+        assert!(
+            inspect_upload_paths(paths.clone()).is_err(),
+            "drag upload's original file-only boundary remains"
+        );
+        let items = inspect_upload_items(paths, true).unwrap();
+        assert!(items[0].is_dir && !items[1].is_dir);
+        assert!(inspect_upload_items(vec![folder.to_str().unwrap().into(); 2], true).is_err());
+        assert!(validate_upload_tree(&folder, Some(&AtomicBool::new(true)))
+            .unwrap_err()
+            .starts_with(CANCELLED));
+    }
+
     #[test]
     fn paths_and_mutations_are_guarded() {
         assert_eq!(normalize_path("/sdcard/a/../b//").unwrap(), "/sdcard/b");

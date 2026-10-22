@@ -17,7 +17,11 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 
 mod adb_server;
+#[cfg(windows)]
+mod clipboard_tree;
 mod device_files;
+#[cfg(windows)]
+mod file_clipboard;
 mod file_dialog;
 #[cfg(windows)]
 mod file_drag;
@@ -1639,6 +1643,8 @@ fn cleanup_runtime_resources(serial_manager: &SerialManager, android_manager: &A
 
 fn cleanup_app_resources(app: &AppHandle) {
     app.state::<device_files::FileManager>().shutdown();
+    #[cfg(windows)]
+    file_clipboard::shutdown();
     let serial_manager = app.state::<SerialManager>();
     let android_manager = app.state::<AndroidManager>();
     cleanup_runtime_resources(&serial_manager, &android_manager);
@@ -1685,6 +1691,8 @@ pub fn run() {
             device_files::choose_device_local_path,
             device_files::inspect_device_upload_paths,
             device_files::drag_device_file,
+            device_files::copy_device_files,
+            device_files::read_device_clipboard_files,
             device_files::transfer_device_file,
             device_files::cancel_device_transfer
         ])
@@ -1699,6 +1707,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            #[cfg(windows)]
+            if matches!(event, RunEvent::MainEventsCleared) {
+                file_clipboard::prune();
+            }
             if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
                 cleanup_app_resources(app);
             }

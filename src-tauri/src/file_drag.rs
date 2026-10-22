@@ -17,7 +17,7 @@ use windows::{
     core::{implement, Ref, Result, BOOL, HRESULT, PWSTR},
     Win32::{
         Foundation::*,
-        Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+        Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL},
         System::{
             Com::*,
             DataExchange::RegisterClipboardFormatW,
@@ -36,6 +36,7 @@ use windows::{
 };
 
 static STAGE_NUMBER: AtomicU64 = AtomicU64::new(0);
+pub const MAX_VIRTUAL_ITEMS: usize = 10000;
 const CANCELLED: &str = "已取消传输";
 pub struct DragPayload {
     pub directory: PathBuf,
@@ -92,6 +93,7 @@ pub fn validate_windows_name(name: &str) -> std::result::Result<(), String> {
 
 type PayloadResult = std::result::Result<Arc<DragPayload>, String>;
 type Loader = Box<dyn Fn(usize) -> PayloadResult + Send + Sync>;
+pub type ClipboardNotice = Box<dyn Fn(&str, bool) + Send + Sync>;
 #[derive(Default)]
 struct Completion {
     drag: Option<std::result::Result<(), String>>,
@@ -100,6 +102,7 @@ struct Completion {
 }
 pub struct DragOperation {
     names: Vec<String>,
+    directories: Vec<bool>,
     loader: Loader,
     files: Vec<OnceLock<PayloadResult>>,
     pub cancel: Arc<AtomicBool>,
@@ -108,6 +111,7 @@ pub struct DragOperation {
     completion: Mutex<Completion>,
     changed: Condvar,
     failure: Mutex<Option<String>>,
+    clipboard_notice: Option<ClipboardNotice>,
 }
 impl DragOperation {
     pub fn new(
@@ -115,15 +119,65 @@ impl DragOperation {
         cancel: Arc<AtomicBool>,
         loader: Loader,
     ) -> std::result::Result<Arc<Self>, String> {
+        Self::create(names, cancel, loader, None)
+    }
+    #[cfg(test)]
+    pub fn for_clipboard(
+        names: Vec<String>,
+        cancel: Arc<AtomicBool>,
+        loader: Loader,
+        notice: ClipboardNotice,
+    ) -> std::result::Result<Arc<Self>, String> {
+        Self::create(names, cancel, loader, Some(notice))
+    }
+    pub fn for_clipboard_tree(
+        entries: Vec<(String, bool)>,
+        cancel: Arc<AtomicBool>,
+        loader: Loader,
+        notice: ClipboardNotice,
+    ) -> std::result::Result<Arc<Self>, String> {
+        validate_virtual_tree(&entries)?;
+        let (names, directories) = entries.into_iter().unzip();
+        Ok(Self::build(
+            names,
+            directories,
+            cancel,
+            loader,
+            Some(notice),
+        ))
+    }
+    fn create(
+        names: Vec<String>,
+        cancel: Arc<AtomicBool>,
+        loader: Loader,
+        clipboard_notice: Option<ClipboardNotice>,
+    ) -> std::result::Result<Arc<Self>, String> {
         if names.is_empty() || names.len() > 256 {
-            return Err("一次请拖出 1–256 个普通文件".into());
+            return Err("一次请选择 1–256 个普通文件".into());
         }
         for name in &names {
             validate_windows_name(name)?;
         }
-        Ok(Arc::new(Self {
+        let directories = vec![false; names.len()];
+        Ok(Self::build(
+            names,
+            directories,
+            cancel,
+            loader,
+            clipboard_notice,
+        ))
+    }
+    fn build(
+        names: Vec<String>,
+        directories: Vec<bool>,
+        cancel: Arc<AtomicBool>,
+        loader: Loader,
+        clipboard_notice: Option<ClipboardNotice>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             files: (0..names.len()).map(|_| OnceLock::new()).collect(),
             names,
+            directories,
             loader,
             cancel,
             async_mode: AtomicBool::new(true),
@@ -131,10 +185,14 @@ impl DragOperation {
             completion: Mutex::new(Completion::default()),
             changed: Condvar::new(),
             failure: Mutex::new(None),
-        }))
+            clipboard_notice,
+        })
     }
     fn payload(&self, index: usize) -> Result<Arc<DragPayload>> {
         self.check_cancel()?;
+        if self.directories.get(index).copied().unwrap_or(true) {
+            return Err(DV_E_LINDEX.into());
+        }
         let result = self
             .files
             .get(index)
@@ -157,6 +215,9 @@ impl DragOperation {
         }
     }
     fn record_error(&self, message: String) {
+        if let Some(notice) = &self.clipboard_notice {
+            notice(&message, true);
+        }
         if let Ok(mut failure) = self.failure.lock() {
             failure.get_or_insert(message);
         }
@@ -375,17 +436,48 @@ fn global(bytes: &[u8]) -> Result<STGMEDIUM> {
         })
     }
 }
-fn descriptors(names: &[String]) -> Vec<u8> {
+fn validate_virtual_tree(entries: &[(String, bool)]) -> std::result::Result<(), String> {
+    if entries.is_empty() || entries.len() > MAX_VIRTUAL_ITEMS {
+        return Err("复制目录最多包含 10000 个项目，请分批选择".into());
+    }
+    let mut seen = HashMap::new();
+    for (name, is_dir) in entries {
+        if name.encode_utf16().count() >= 260 {
+            return Err(
+                "复制目录的相对路径超过 Windows 剪贴板长度限制，请选择更深层的子目录".into(),
+            );
+        }
+        for component in name.split('\\') {
+            validate_windows_name(component)?;
+        }
+        let key = name.to_lowercase();
+        if let Some((parent, _)) = key.rsplit_once('\\') {
+            if seen.get(parent) != Some(&true) {
+                return Err("复制目录清单缺少父目录或父项不是目录".into());
+            }
+        }
+        if seen.insert(key, *is_dir).is_some() {
+            return Err("复制目录存在 Windows 同名冲突".into());
+        }
+    }
+    Ok(())
+}
+
+fn descriptors(names: &[String], directories: &[bool]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(4 + names.len() * size_of::<FILEDESCRIPTORW>());
     bytes.extend_from_slice(&(names.len() as u32).to_le_bytes());
-    for name in names {
+    for (name, is_dir) in names.iter().zip(directories) {
         let mut filename = [0u16; 260];
         for (slot, value) in filename.iter_mut().zip(name.encode_utf16()) {
             *slot = value;
         }
         let descriptor = FILEDESCRIPTORW {
             dwFlags: (FD_ATTRIBUTES.0 | FD_PROGRESSUI.0 | FD_UNICODE.0) as u32,
-            dwFileAttributes: FILE_ATTRIBUTE_NORMAL.0,
+            dwFileAttributes: if *is_dir {
+                FILE_ATTRIBUTE_DIRECTORY.0
+            } else {
+                FILE_ATTRIBUTE_NORMAL.0
+            },
             cFileName: filename,
             ..Default::default()
         };
@@ -409,7 +501,7 @@ struct VirtualFiles {
     preferred: u16,
     private: Mutex<HashMap<(u16, i32), Vec<u8>>>,
 }
-fn virtual_files(operation: Arc<DragOperation>) -> Result<IDataObject> {
+pub(crate) fn virtual_files(operation: Arc<DragOperation>) -> Result<IDataObject> {
     Ok(VirtualFiles {
         operation,
         descriptor: clipboard(CFSTR_FILEDESCRIPTORW)?,
@@ -424,7 +516,10 @@ impl IDataObject_Impl for VirtualFiles_Impl {
         self.QueryGetData(input).ok()?;
         let input = unsafe { &*input };
         if input.cfFormat == self.descriptor {
-            return global(&descriptors(&self.operation.names));
+            return global(&descriptors(
+                &self.operation.names,
+                &self.operation.directories,
+            ));
         }
         if input.cfFormat == self.preferred {
             return global(&DROPEFFECT_COPY.0.to_le_bytes());
@@ -473,7 +568,14 @@ impl IDataObject_Impl for VirtualFiles_Impl {
         let medium = if input.cfFormat == self.descriptor || input.cfFormat == self.preferred {
             TYMED_HGLOBAL
         } else if input.cfFormat == self.contents {
-            if input.lindex < 0 || input.lindex as usize >= self.operation.names.len() {
+            if input.lindex < 0
+                || self
+                    .operation
+                    .directories
+                    .get(input.lindex as usize)
+                    .copied()
+                    .unwrap_or(true)
+            {
                 return DV_E_LINDEX;
             }
             TYMED_ISTREAM
@@ -552,7 +654,15 @@ impl IDataObject_Impl for VirtualFiles_Impl {
         }
         let mut formats = vec![
             format(self.descriptor, TYMED_HGLOBAL, -1),
-            format(self.contents, TYMED_ISTREAM, 0),
+            format(
+                self.contents,
+                TYMED_ISTREAM,
+                self.operation
+                    .directories
+                    .iter()
+                    .position(|directory| !directory)
+                    .unwrap_or(0) as i32,
+            ),
             format(self.preferred, TYMED_HGLOBAL, -1),
         ];
         for &(id, index) in self
@@ -586,11 +696,21 @@ impl IDataObjectAsyncCapability_Impl for VirtualFiles_Impl {
         Ok(self.operation.async_mode.load(Ordering::SeqCst).into())
     }
     fn StartOperation(&self, _: Ref<'_, IBindCtx>) -> Result<()> {
-        self.operation
+        self.operation.check_cancel()?;
+        let mut completion = self
+            .operation
             .completion
             .lock()
-            .map_err(|_| windows::core::Error::from(E_FAIL))?
-            .asynchronous = true;
+            .map_err(|_| windows::core::Error::from(E_FAIL))?;
+        completion.asynchronous = true;
+        completion.end = None;
+        drop(completion);
+        if let Some(notice) = &self.operation.clipboard_notice {
+            notice(
+                "正在粘贴到电脑，下载进度与取消请查看 Windows 复制窗口…",
+                false,
+            );
+        }
         self.operation.changed.notify_all();
         Ok(())
     }
@@ -603,7 +723,7 @@ impl IDataObjectAsyncCapability_Impl for VirtualFiles_Impl {
         Ok((completion.asynchronous && completion.end.is_none()).into())
     }
     fn EndOperation(&self, result: HRESULT, _: Ref<'_, IBindCtx>, effect: u32) -> Result<()> {
-        let outcome = if result == E_ABORT || result == HRESULT(0x800704c7u32 as i32) {
+        let mut outcome = if result == E_ABORT || result == HRESULT(0x800704c7u32 as i32) {
             Err(CANCELLED.into())
         } else if result.is_err() {
             Err(format!(
@@ -615,6 +735,25 @@ impl IDataObjectAsyncCapability_Impl for VirtualFiles_Impl {
         } else {
             Ok(())
         };
+        if outcome.is_ok() {
+            if let Some(error) = self
+                .operation
+                .failure
+                .lock()
+                .map_err(|_| windows::core::Error::from(E_FAIL))?
+                .clone()
+            {
+                outcome = Err(error);
+            }
+        }
+        if let Some(notice) = &self.operation.clipboard_notice {
+            if let Err(error) = &outcome {
+                self.operation.cancel.store(true, Ordering::SeqCst);
+                notice(&format!("{error}；如需重试，请重新复制设备文件。"), true);
+            } else {
+                notice("已复制到电脑文件夹", false);
+            }
+        }
         self.operation
             .completion
             .lock()
@@ -855,6 +994,194 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use windows::core::Interface;
+
+    #[test]
+    fn virtual_folder_descriptors_preserve_hierarchy_and_do_not_read_directories() {
+        let _ole = apartment();
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&count);
+        let operation = DragOperation::for_clipboard_tree(
+            vec![
+                ("folder".into(), true),
+                ("folder\\empty".into(), true),
+                ("folder\\nested.bin".into(), false),
+                ("plain.txt".into(), false),
+            ],
+            Arc::new(AtomicBool::new(false)),
+            Box::new(move |index| {
+                assert!(index == 2 || index == 3);
+                calls.fetch_add(1, Ordering::SeqCst);
+                let payload = Arc::new(DragPayload::create()?);
+                fs::write(&payload.path, [index as u8, 0, 255])
+                    .map_err(|error| error.to_string())?;
+                Ok(payload)
+            }),
+            Box::new(|_, _| {}),
+        )
+        .unwrap();
+        let object = virtual_files(operation).unwrap();
+        unsafe {
+            let mut medium = object
+                .GetData(&format(
+                    clipboard(CFSTR_FILEDESCRIPTORW).unwrap(),
+                    TYMED_HGLOBAL,
+                    -1,
+                ))
+                .unwrap();
+            let memory = medium.u.hGlobal;
+            let pointer = GlobalLock(memory).cast::<u8>();
+            assert!(!pointer.is_null());
+            assert_eq!(std::ptr::read_unaligned(pointer.cast::<u32>()), 4);
+            for index in 0..4 {
+                let entry = std::ptr::read_unaligned(
+                    pointer
+                        .add(4 + index * size_of::<FILEDESCRIPTORW>())
+                        .cast::<FILEDESCRIPTORW>(),
+                );
+                assert_eq!(
+                    entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0,
+                    index < 2
+                );
+                if index == 2 {
+                    let filename = entry.cFileName;
+                    let length = filename.iter().position(|&value| value == 0).unwrap();
+                    assert_eq!(
+                        String::from_utf16(&filename[..length]).unwrap(),
+                        "folder\\nested.bin"
+                    );
+                }
+            }
+            let _ = GlobalUnlock(memory);
+            ReleaseStgMedium(&mut medium);
+            assert!(object
+                .QueryGetData(&format(
+                    clipboard(CFSTR_FILECONTENTS).unwrap(),
+                    TYMED_ISTREAM,
+                    0
+                ))
+                .is_err());
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(read(&contents(&object, 2)), [2, 0, 255]);
+        assert_eq!(read(&contents(&object, 3)), [3, 0, 255]);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn empty_folders_and_invalid_virtual_hierarchies_are_handled() {
+        let _ole = apartment();
+        let operation = DragOperation::for_clipboard_tree(
+            vec![("empty".into(), true)],
+            Arc::new(AtomicBool::new(false)),
+            Box::new(|_| panic!("empty directories must not request file data")),
+            Box::new(|_, _| {}),
+        )
+        .unwrap();
+        let object = virtual_files(operation).unwrap();
+        let asynchronous: IDataObjectAsyncCapability = object.cast().unwrap();
+        unsafe {
+            asynchronous.StartOperation(None::<&IBindCtx>).unwrap();
+            asynchronous
+                .EndOperation(S_OK, None::<&IBindCtx>, DROPEFFECT_COPY.0)
+                .unwrap();
+        }
+        for entries in [
+            vec![("..\\escape".into(), false)],
+            vec![("C:\\file".into(), false)],
+            vec![("missing\\child".into(), false)],
+            vec![("file".into(), false), ("file\\child".into(), false)],
+            vec![("Folder".into(), true), ("folder".into(), true)],
+        ] {
+            assert!(validate_virtual_tree(&entries).is_err());
+        }
+    }
+
+    #[test]
+    fn clipboard_files_are_lazy_repeatable_and_report_cancellation() {
+        let _ole = apartment();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&notices);
+        let operation = DragOperation::for_clipboard(
+            vec!["copy.bin".into()],
+            Arc::new(AtomicBool::new(false)),
+            Box::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let payload = Arc::new(DragPayload::create()?);
+                fs::write(&payload.path, b"copied\0binary").map_err(|error| error.to_string())?;
+                Ok(payload)
+            }),
+            Box::new(move |message, error| {
+                captured.lock().unwrap().push((message.to_owned(), error))
+            }),
+        )
+        .unwrap();
+        let object = virtual_files(Arc::clone(&operation)).unwrap();
+        let asynchronous: IDataObjectAsyncCapability = object.cast().unwrap();
+        assert!(crate::file_clipboard::paths_from_object(&object)
+            .unwrap()
+            .is_empty());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        for _ in 0..2 {
+            unsafe {
+                asynchronous.StartOperation(None::<&IBindCtx>).unwrap();
+                assert!(asynchronous.InOperation().unwrap().as_bool());
+                assert_eq!(read(&contents(&object, 0)), b"copied\0binary");
+                asynchronous
+                    .EndOperation(S_OK, None::<&IBindCtx>, DROPEFFECT_COPY.0)
+                    .unwrap();
+                assert!(!asynchronous.InOperation().unwrap().as_bool());
+            }
+        }
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "repeat paste uses retained content, not a different device"
+        );
+        unsafe {
+            asynchronous.StartOperation(None::<&IBindCtx>).unwrap();
+            asynchronous
+                .EndOperation(E_ABORT, None::<&IBindCtx>, DROPEFFECT_NONE.0)
+                .unwrap();
+            assert!(asynchronous.StartOperation(None::<&IBindCtx>).is_err());
+        }
+        assert!(operation.cancel.load(Ordering::SeqCst));
+        assert!(notices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(message, error)| *error && message.contains("重新复制")));
+    }
+
+    #[test]
+    fn clipboard_hdrop_data_is_read_without_touching_the_system_clipboard() {
+        let _ole = apartment();
+        let (operation, calls, _) = fixture();
+        let object = virtual_files(operation).unwrap();
+        let paths = [r"C:\mock\中文 空格.txt", r"D:\other.bin"];
+        let mut bytes = vec![0; size_of::<DROPFILES>()];
+        let offset = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&offset.to_le_bytes());
+        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+        for path in paths {
+            for unit in path.encode_utf16().chain(Some(0)) {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        unsafe {
+            let medium = global(&bytes).unwrap();
+            object
+                .SetData(&format(CF_HDROP.0, TYMED_HGLOBAL, -1), &medium, true)
+                .unwrap();
+        }
+        assert_eq!(
+            crate::file_clipboard::paths_from_object(&object).unwrap(),
+            paths
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     fn apartment() -> OleApartment {
         unsafe {

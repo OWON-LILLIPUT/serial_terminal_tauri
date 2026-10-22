@@ -15,6 +15,7 @@ export interface DeviceFileEntry {
 interface DirectoryListing { path: string; entries: DeviceFileEntry[] }
 interface LocalSelection { path: string; name: string; is_dir: boolean; exists: boolean; size: number }
 interface UploadItem { local: LocalSelection; name: string }
+interface ClipboardStatus { id: string; device_id: string; message: string; error: boolean }
 interface DirectoryHistoryEntry { path: string; scroll: number }
 interface TransferProgress {
   id: string;
@@ -59,6 +60,7 @@ interface FileSession {
   cancelling: boolean;
   batch: { cancelled: boolean } | null;
   dragging: boolean;
+  clipboardId: string;
 }
 interface FileDialog {
   session: FileSession;
@@ -97,6 +99,7 @@ const fileMenuActions = [
   ["up", "上一级", "E74A"], ["go", "前往", "E8A7"], ["refresh", "刷新", "E72C"],
   ["upload-file", "上传文件", "E898"], ["upload-directory", "上传目录", "E8B7"],
   ["download", "下载", "E896"], ["mkdir", "新建目录", "E8F4"],
+  ["copy", "复制（Ctrl+C）", "E8C8"], ["paste", "粘贴（Ctrl+V）", "E77F"],
   ["rename", "重命名", "E8AC"], ["delete", "删除", "E74D"], ["sync", "同步到硬盘", "E74E"],
 ] as const;
 
@@ -154,6 +157,13 @@ export class DeviceFiles {
   constructor(private hooks: FileHooks) {
     this.ready = Promise.all([
       listen<TransferProgress>("device-file-transfer", event => this.onProgress(event.payload)),
+      listen<ClipboardStatus>("device-file-clipboard", event => {
+        const status = event.payload, session = this.sessions.get(`device-files:${status.device_id}`);
+        if (!session || session.clipboardId !== status.id) return;
+        if (status.error) session.error = status.message;
+        else session.message = status.message;
+        this.update(session);
+      }),
       getCurrentWebview().onDragDropEvent(event => this.onDragDrop(event.payload)),
     ]).then(() => {});
     // Report listener errors on the file page rather than creating an unhandled rejection.
@@ -179,6 +189,16 @@ export class DeviceFiles {
     document.addEventListener("pointercancel", () => { this.endMarquee(); this.dragCandidate = null; this.pointerSelection = null; });
     document.addEventListener("keydown", event => {
       const session = this.sessions.get(this.hooks.activeId());
+      const target = event.target instanceof Element ? event.target : null;
+      const key = event.key.toLowerCase();
+      if (session && !event.defaultPrevented && (event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey
+        && ["c", "v"].includes(key) && !this.dialog
+        && target?.closest(".device-files, .device-files-context-menu")
+        && !target.closest("input, textarea, [contenteditable]")) {
+        event.preventDefault(); event.stopPropagation();
+        if (!event.repeat) void this.action(session, key === "c" ? "copy" : "paste");
+        return;
+      }
       if (session && ["BrowserBack", "BrowserForward"].includes(event.key)) {
         event.preventDefault(); event.stopPropagation();
         if (!event.repeat) void this.travelHistory(session, event.key === "BrowserBack" ? -1 : 1);
@@ -205,7 +225,7 @@ export class DeviceFiles {
         id, deviceId, path: "/", draftPath: "/", history: [], historyIndex: -1, entries: [], directories: new Map(), readAt: new Map(), pendingReads: new Map(),
         expanded: new Set(["/"]), treeLoading: new Map(), treeErrors: new Map(), selected: "", selectedNavigation: "", selectedPaths: new Set(), selectionAnchor: "",
         loading: false, busy: false, request: 0, error: "", message: "", scroll: 0, treeScroll: 0,
-        transfer: null, cancelling: false, batch: null, dragging: false, cacheVersion: 0, lastOnline: this.hooks.online(deviceId), syncing: false, viewportHeight: 600,
+        transfer: null, cancelling: false, batch: null, dragging: false, clipboardId: "", cacheVersion: 0, lastOnline: this.hooks.online(deviceId), syncing: false, viewportHeight: 600,
       };
       this.sessions.set(id, session);
       this.hooks.activate(id);
@@ -274,7 +294,7 @@ export class DeviceFiles {
       ${!online ? '<div class="device-files-notice">设备未连接或未授权，请重新连接后刷新。此标签仍绑定原设备。</div>' : ""}
       <div class="device-files-body">
         <nav class="device-files-tree" aria-label="设备目录树">${this.renderTree(session, "/", 0, new Set())}</nav>
-        <div class="device-files-list" tabindex="0" aria-label="设备文件列表" title="空白处按住左键框选；拖入电脑文件上传；拖动普通文件到电脑文件夹或桌面下载">
+        <div class="device-files-list" tabindex="0" aria-label="设备文件列表" title="空白处按住左键框选；Ctrl+C 复制设备文件或文件夹到电脑粘贴下载；Ctrl+V 粘贴电脑文件或文件夹上传；支持拖入/拖出普通文件">
           <table class="device-files-table"><colgroup><col class="device-files-name-column"><col class="device-files-size-column"><col class="device-files-modified-column"><col class="device-files-permissions-column"></colgroup>
             <thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th></tr></thead>
             <tbody>${this.renderRows(session)}</tbody></table>
@@ -349,7 +369,7 @@ export class DeviceFiles {
       <div class="device-files-dialog-message">${escape(dialog.message)}</div>
       ${dialog.input != null ? `<input id="device-files-dialog-input" class="text-input" aria-label="名称" value="${escape(dialog.input)}" maxlength="255" autocomplete="off" />` : ""}
       ${dialog.uploads ? `<div class="device-files-upload-names">${dialog.uploads.map((item, index) => `<label class="device-files-upload-name">
-        <span title="${escape(item.local.path)}">${escape(item.local.name)} · ${sizeText(item.local.size)}</span>
+        <span title="${escape(item.local.path)}">${escape(item.local.name)} · ${item.local.is_dir ? "文件夹（包含子目录）" : sizeText(item.local.size)}</span>
         <input id="device-files-upload-name-${index}" class="text-input" data-upload-name="${index}" aria-label="文件 ${index + 1} 上传名称" value="${escape(item.name)}" maxlength="255" autocomplete="off" />
       </label>`).join("")}</div>` : ""}
       ${dialog.error ? `<div class="error-text">${escape(dialog.error)}</div>` : ""}
@@ -707,6 +727,10 @@ export class DeviceFiles {
     if (!this.live(session) || !this.hooks.online(session.deviceId) || session.busy || session.loading) return true;
     if (["up", "go", "refresh"].includes(action)) return action === "up" && target.directory === "/";
     if (session.syncing || transferRunning(session)) return true;
+    if (action === "copy") {
+      const entries = target.entries ?? (target.entry ? [target.entry] : []);
+      return !entries.length || entries.length > 256 || entries.some(entry => !["file", "directory"].includes(entry.kind));
+    }
     if (action === "delete") return !(target.entries?.length || target.entry);
     if (["download", "rename"].includes(action)) return !!target.multiple || !target.entry || (action === "download" && target.entry.kind === "other");
     return false;
@@ -892,6 +916,8 @@ export class DeviceFiles {
     }
     if (action === "sync") { await this.sync(session); return; }
     const { entry, directory } = target;
+    if (action === "copy") { await this.copyFiles(session, target.entries ?? (entry ? [entry] : [])); return; }
+    if (action === "paste") { await this.prepareDroppedFiles(session, directory, null); return; }
     if (action.startsWith("upload-")) { await this.upload(session, action, directory); return; }
     if (action === "download" && entry) { await this.download(session, entry); return; }
     if (action === "mkdir") {
@@ -1012,12 +1038,34 @@ export class DeviceFiles {
     void this.prepareDroppedFiles(session, target.directory, event.paths);
   }
 
-  private async prepareDroppedFiles(session: FileSession, directory: string, paths: string[]): Promise<void> {
+  private async copyFiles(session: FileSession, entries: DeviceFileEntry[]): Promise<void> {
+    if (this.dialog || !entries.length) return;
+    const remotePaths = entries.map(entry => entry.path);
+    const remoteDirectories = entries.filter(entry => entry.kind === "directory").map(entry => entry.path);
+    const id = crypto.randomUUID();
+    session.clipboardId = id;
+    session.busy = true; session.error = ""; session.message = remoteDirectories.length ? "正在读取目录结构，准备复制…" : ""; this.update(session);
+    try {
+      await this.ready;
+      await invoke<void>("copy_device_files", { id, deviceId: session.deviceId, remotePaths, remoteDirectories });
+      if (this.live(session) && session.clipboardId === id) {
+        session.message = `已复制 ${entries.length} 个${remoteDirectories.length ? "项目（含文件夹）" : "文件"}，请到电脑文件夹或桌面按 Ctrl+V 下载（粘贴完成前保持软件运行）。`;
+      }
+    } catch (error) { session.error = message(error); session.message = ""; }
+    finally { session.busy = false; this.update(session); }
+  }
+
+  private async prepareDroppedFiles(session: FileSession, directory: string, paths: string[] | null): Promise<void> {
     if (this.dialog || this.actionDisabled(session, "upload-file")) return;
     session.busy = true; session.error = ""; this.closeContextMenu(); this.update(session);
     try {
-      const locals = await invoke<LocalSelection[]>("inspect_device_upload_paths", { paths });
+      const localPaths = paths ?? await invoke<string[]>("read_device_clipboard_files");
+      if (!localPaths.length) throw new Error("剪贴板中没有可上传的文件，请先在 Windows 资源管理器中复制文件。");
+      const locals = await invoke<LocalSelection[]>("inspect_device_upload_paths", { paths: localPaths, allowDirectories: paths === null });
       if (!this.live(session)) return;
+      if (this.dialog || (paths === null && this.hooks.activeId() !== session.id)) {
+        session.message = "已取消粘贴，请回到目标文件页后重试。"; return;
+      }
       const items = locals.map(local => ({ local, name: local.name }));
       this.uploadNamesDialog(session, directory, items);
     } catch (error) { session.error = message(error); }
@@ -1025,7 +1073,7 @@ export class DeviceFiles {
   }
 
   private uploadNamesDialog(session: FileSession, directory: string, items: UploadItem[], error = ""): void {
-    this.dialog = { session, title: `确认上传名称（${items.length} 个文件）`, message: `${session.deviceId}\n上传到：${directory}\n可修改每个文件名称；取消不会上传任何文件。`,
+    this.dialog = { session, title: `确认上传名称（${items.length} 个${items.some(item => item.local.is_dir) ? "项目" : "文件"}）`, message: `${session.deviceId}\n上传到：${directory}\n可修改每个文件或文件夹名称；文件夹包含其子目录，已有目录不合并覆盖；取消不会上传任何项目。`,
       input: null, uploads: items, accept: "确认上传", danger: false, error,
       submit: () => { void this.confirmDroppedFiles(session, directory, items); } };
     this.hooks.render();
@@ -1040,8 +1088,8 @@ export class DeviceFiles {
       if (!this.live(session)) return;
       const existing = new Map(listing.entries.map(entry => [entry.name, entry]));
       const conflicts = items.filter(item => existing.has(item.name));
-      if (conflicts.some(item => existing.get(item.name)!.kind !== "file")) {
-        this.uploadNamesDialog(session, directory, items, "同名目录或符号链接不能覆盖，请修改对应上传名称。"); return;
+      if (conflicts.some(item => item.local.is_dir || existing.get(item.name)!.kind !== "file")) {
+        this.uploadNamesDialog(session, directory, items, "涉及目录或符号链接的同名项目不能覆盖，请修改对应上传名称。"); return;
       }
       const start = () => { void this.uploadBatch(session, directory, items, new Set(conflicts.map(item => item.name))); };
       if (conflicts.length) {
@@ -1070,7 +1118,7 @@ export class DeviceFiles {
     }
     session.batch = null;
     session.cancelling = false;
-    const summary = `${batch.cancelled ? "已取消后续上传" : completed === items.length ? "上传完成" : "上传中止"}：${completed}/${items.length} 个文件`;
+    const summary = `${batch.cancelled ? "已取消后续上传" : completed === items.length ? "上传完成" : "上传中止"}：${completed}/${items.length} 个${items.some(item => item.local.is_dir) ? "项目" : "文件"}`;
     if (session.transfer) session.transfer = { ...session.transfer, phase: batch.cancelled ? "cancelled" : completed === items.length ? "completed" : "failed", message: `${summary}${session.transfer.phase === "failed" ? `；${session.transfer.message}` : ""}` };
     this.scheduleTransferDismiss(session);
     session.message = summary;

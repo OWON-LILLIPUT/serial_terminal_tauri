@@ -27,6 +27,10 @@ let failNextUpload = false;
 let failDeletePath = "";
 let hideAdbDevices = false;
 let failNextAdbAction = "";
+let clipboardPaths = ["C:\\mock\\drag-clip-a.txt", "D:\\mock\\drag-clip-b.bin"];
+let failClipboardRead = false;
+let failClipboardCopy = false;
+const clipboardDirectories = new Set<string>();
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 localStorage.setItem("serial-terminal-settings-v1", JSON.stringify({ selectedAdbDevice: "TEST-A" }));
 mockWindows("main");
@@ -78,8 +82,21 @@ mockIPC(async (command, args: any = {}) => {
   }
   if (command === "inspect_device_upload_paths") {
     await delay(20);
-    if (!args.paths.length || args.paths.some((path: string) => path.endsWith("folder"))) throw new Error("拖入上传暂只支持普通文件");
-    return args.paths.map((path: string) => ({ path, name: path.split(/[/\\]/).at(-1), exists: true, is_dir: false, size: 12345 }));
+    const isDirectory = (path: string) => clipboardDirectories.has(path) || path.endsWith("folder");
+    if (!args.paths.length || (!args.allowDirectories && args.paths.some(isDirectory))) throw new Error("拖入上传暂只支持普通文件");
+    return args.paths.map((path: string) => ({ path, name: path.split(/[/\\]/).at(-1), exists: true, is_dir: isDirectory(path), size: 12345 }));
+  }
+  if (command === "copy_device_files") {
+    const fail = failClipboardCopy; failClipboardCopy = false;
+    await delay(30);
+    if (fail) throw new Error("simulated clipboard busy");
+    return null;
+  }
+  if (command === "read_device_clipboard_files") {
+    const fail = failClipboardRead; failClipboardRead = false;
+    await delay(30);
+    if (fail) throw new Error("simulated clipboard read denied");
+    return [...clipboardPaths];
   }
   if (command === "drag_device_file") {
     const record = { cancel: false }; nativeDrags.set(args.id, record);
@@ -110,7 +127,9 @@ mockIPC(async (command, args: any = {}) => {
       const parent = remote.slice(0, remote.lastIndexOf("/")) || "/";
       const name = remote.slice(remote.lastIndexOf("/") + 1);
       const entries = files.get(record.request.device_id)!.get(parent)!;
-      if (!entries.some(item => item.name === name)) entries.push(entry(parent, name));
+      const isDirectory = clipboardDirectories.has(record.request.local_path);
+      if (!entries.some(item => item.name === name)) entries.push(entry(parent, name, isDirectory));
+      if (isDirectory) files.get(record.request.device_id)!.set(remote, []);
     }
     await emit("device-file-transfer", { id: record.request.id, device_id: record.request.device_id, phase: record.cancel ? "cancelled" : "completed", message: record.cancel ? "已取消传输" : "传输完成", percent: record.cancel ? null : 100, bytes: 100000, total: 100000, elapsed_ms: 800 });
     transfers.delete(record.request.id);
@@ -288,7 +307,7 @@ document.querySelector("#run-ui-tests")!.addEventListener("click", async () => {
     assert(menu?.parentElement === document.body && menu.classList.contains("terminal-context-menu"), "menu uses terminal theme in unclipped portal");
     assert(document.querySelector('[data-file-path="/sdcard/.hidden"]')!.getAttribute("aria-selected") === "true", "right click selects target row");
     assert(document.querySelector("#adb-root") === contextSidebar, "opening menu doesn't rebuild sidebar");
-    const expected = ["up", "go", "refresh", "upload-file", "upload-directory", "download", "mkdir", "rename", "delete", "sync"];
+    const expected = ["up", "go", "refresh", "upload-file", "upload-directory", "download", "mkdir", "copy", "paste", "rename", "delete", "sync"];
     assert(expected.every(action => menu.querySelector(menuActions(action))) && menu.querySelectorAll("button").length === expected.length, "all top actions are in menu");
     assert([...menu.querySelectorAll("button")].every(button => button.classList.contains("terminal-context-item")), "items share terminal menu style");
     const bounds = menu.getBoundingClientRect();
@@ -535,7 +554,7 @@ document.querySelector("#run-drag-tests")!.addEventListener("click", async () =>
     await dropFiles(sources);
     await waitFor(() => !!document.querySelector("[data-upload-name]"), "directory conflict setup");
     submitUploadNames(["Download", "drag-unused.txt"]);
-    await waitFor(() => document.querySelector(".device-files-dialog .error-text")?.textContent?.includes("同名目录") === true, "directory overwrite rejected");
+    await waitFor(() => document.querySelector(".device-files-dialog .error-text")?.textContent?.includes("同名项目不能覆盖") === true, "directory overwrite rejected");
     click("#device-files-dialog-cancel"); ++passed;
     const beforeCancel = uploads().length;
     await dropFiles(sources);
@@ -802,6 +821,157 @@ document.querySelector("#run-history-tests")!.addEventListener("click", async ()
     click('[data-files-tab="device-files:TEST-A"]'); await arrived("/system"); ++passed;
     result.textContent = `PASS：${passed} 组侧键历史回归；仅模拟设备`;
   } catch (error) { result.textContent = `FAIL（侧键已过 ${passed} 组）：${String(error)}`; console.error(error); }
+  finally { run.disabled = false; }
+});
+
+document.querySelector("#run-clipboard-tests")!.addEventListener("click", async () => {
+  const run = document.querySelector<HTMLButtonElement>("#run-clipboard-tests")!;
+  const result = document.querySelector("#ui-test-result")!;
+  const clipboardCalls = (name: string) => calls.filter(call => call.command === name);
+  const key = (target: Element, value: string, repeat = false) => {
+    const event = new KeyboardEvent("keydown", { key: value, ctrlKey: true, repeat, bubbles: true, cancelable: true });
+    target.dispatchEvent(event); return event;
+  };
+  const list = () => document.querySelector<HTMLElement>(".device-files-list")!;
+  const ready = () => !document.querySelector<HTMLButtonElement>(actions("refresh"))!.disabled;
+  const text = (value: string) => document.querySelector(".device-files")?.textContent?.includes(value) === true;
+  run.disabled = true;
+  let passed = 0;
+  try {
+    await waitFor(() => !document.querySelector<HTMLButtonElement>("#device-files-open")!.disabled, "devices loaded");
+    click("#device-files-open");
+    await waitFor(() => !!document.querySelector('[data-file-path="/sdcard"]'), "file root");
+    await navigate("/sdcard");
+    click('[data-file-path="/sdcard/.hidden"]');
+    document.querySelector('[data-file-path="/sdcard/upload.txt"]')!.dispatchEvent(new MouseEvent("click", { ctrlKey: true, bubbles: true }));
+    assert(key(list(), "c").defaultPrevented, "file copy intercepts Ctrl+C");
+    await waitFor(() => clipboardCalls("copy_device_files").length === 1 && text("已复制 2 个文件") && ready(), "copy publication");
+    const copied = clipboardCalls("copy_device_files")[0].args;
+    assert(copied.deviceId === "TEST-A" && copied.remotePaths.join("|") === "/sdcard/.hidden|/sdcard/upload.txt", "copy snapshots exact device and selected paths");
+    assert(!transferCalls().length && !document.querySelector(".device-files-transfer progress"), "copy is not an eager download or endless busy transfer"); ++passed;
+    key(list(), "c", true); await delay(40);
+    assert(clipboardCalls("copy_device_files").length === 1, "repeat key doesn't republish clipboard");
+    const input = document.querySelector<HTMLInputElement>("#device-files-path")!;
+    assert(!key(input, "v").defaultPrevented && !key(input, "c").defaultPrevented, "path input retains normal text clipboard shortcuts");
+    assert(!clipboardCalls("read_device_clipboard_files").length, "input never reads native file clipboard"); ++passed;
+    rightClick('[data-file-path="/sdcard/.hidden"]');
+    assert(!document.querySelector<HTMLButtonElement>(menuActions("copy"))!.disabled && !document.querySelector<HTMLButtonElement>(menuActions("paste"))!.disabled, "menu exposes themed file copy/paste");
+    click(menuActions("copy"));
+    await waitFor(() => clipboardCalls("copy_device_files").length === 2 && ready(), "menu copy publication");
+    key(list(), "v");
+    await waitFor(() => document.querySelectorAll("[data-upload-name]").length === 2, "paste opens per-file rename confirmation");
+    assert(document.querySelector("#device-files-dialog")?.textContent?.includes("上传到：/sdcard"), "paste captures target directory");
+    const clipboardReads = clipboardCalls("read_device_clipboard_files").length;
+    assert(!key(document.querySelector("[data-upload-name]")!, "v").defaultPrevented, "rename input paste stays native text");
+    key(list(), "v"); await delay(40);
+    assert(clipboardCalls("read_device_clipboard_files").length === clipboardReads, "modal blocks another file paste");
+    click("#device-files-dialog-cancel");
+    assert(!transferCalls().length, "cancel confirmation uploads nothing"); ++passed;
+    key(list(), "v");
+    await waitFor(() => document.querySelectorAll("[data-upload-name]").length === 2, "second paste confirmation");
+    for (const [index, name] of ["clipboard-a.txt", "clipboard-b.bin"].entries()) {
+      const field = document.querySelector<HTMLInputElement>(`[data-upload-name="${index}"]`)!;
+      field.value = name; field.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    document.querySelector<HTMLFormElement>("#device-files-dialog")!.requestSubmit();
+    await waitFor(() => transferCalls().length > 0, "paste upload starts after confirm");
+    click('[data-picker-id="adbDevice"]'); click('[data-picker-value="TEST-B"]');
+    await waitFor(() => transferCalls().length === 2 && text("上传完成：2/2") && ready(), "batch pasted upload completes");
+    assert(transferCalls().every(call => call.args.request.device_id === "TEST-A" && call.args.request.direction === "upload"), "selector changes don't redirect pasted upload");
+    assert(transferCalls().map(call => call.args.request.remote_path).join("|") === "/sdcard/clipboard-a.txt|/sdcard/clipboard-b.bin", "each renamed file uses captured directory"); ++passed;
+    clipboardPaths = [];
+    const inspected = clipboardCalls("inspect_device_upload_paths").length;
+    key(list(), "v");
+    await waitFor(() => text("剪贴板中没有可上传的文件") && ready(), "empty clipboard feedback");
+    assert(clipboardCalls("inspect_device_upload_paths").length === inspected && !document.querySelector("#device-files-dialog"), "text/empty clipboard cannot upload paths"); ++passed;
+    failClipboardRead = true; key(list(), "v");
+    await waitFor(() => text("simulated clipboard read denied") && ready(), "clipboard read failure recovers"); ++passed;
+    click('[data-file-path="/sdcard/.hidden"]'); failClipboardCopy = true; key(list(), "c");
+    await waitFor(() => text("simulated clipboard busy") && ready(), "copy publication failure recovers"); ++passed;
+    const beforeInvalid = clipboardCalls("copy_device_files").length;
+    click('[data-file-navigation="parent"]'); key(list(), "c");
+    assert(clipboardCalls("copy_device_files").length === beforeInvalid, "parent navigation isn't copied as a file");
+    click('[data-file-path="/sdcard/Download"]'); key(list(), "c"); await delay(40);
+    assert(clipboardCalls("copy_device_files").length === beforeInvalid + 1 && clipboardCalls("copy_device_files").at(-1)!.args.remoteDirectories.join() === "/sdcard/Download", "folder copy carries directory metadata"); ++passed;
+    clipboardPaths = ["C:\\mock\\drag-late.txt"];
+    key(list(), "v"); click('[data-terminal-tab-id="serial"]'); await delay(100);
+    assert(!document.querySelector("#device-files-dialog"), "paste returning after tab switch doesn't open a modal in the terminal");
+    const beforeTerminal = clipboardCalls("read_device_clipboard_files").length;
+    key(document.querySelector(".terminal-surface") ?? document.body, "v"); await delay(30);
+    assert(clipboardCalls("read_device_clipboard_files").length === beforeTerminal, "terminal shortcuts aren't file upload shortcuts");
+    click('[data-files-tab="device-files:TEST-A"]'); await waitFor(ready, "file tab restored"); ++passed;
+    click('[data-file-path="/sdcard/.hidden"]'); key(list(), "c");
+    await waitFor(() => text("已复制 1 个文件") && ready(), "copy restored after failures");
+    const latest = clipboardCalls("copy_device_files").at(-1)!.args;
+    await emit("device-file-clipboard", { id: latest.id, device_id: "TEST-A", message: "mock paste completed", error: false });
+    await waitFor(() => text("mock paste completed"), "native clipboard completion routed");
+    await emit("device-file-clipboard", { id: copied.id, device_id: "TEST-A", message: "stale clipboard notice", error: true }); await delay(30);
+    assert(!text("stale clipboard notice") && ready(), "old copy notifications don't overwrite new clipboard state or lock buttons"); ++passed;
+    result.textContent = `PASS：${passed} 组文件剪贴板回归；未访问系统剪贴板或真实设备`;
+  } catch (error) { result.textContent = `FAIL（剪贴板已过 ${passed} 组）：${String(error)}`; console.error(error); }
+  finally { run.disabled = false; }
+});
+
+document.querySelector("#run-folder-clipboard-tests")!.addEventListener("click", async () => {
+  const run = document.querySelector<HTMLButtonElement>("#run-folder-clipboard-tests")!;
+  const result = document.querySelector("#ui-test-result")!;
+  const key = (value: string) => document.querySelector(".device-files-list")!.dispatchEvent(new KeyboardEvent("keydown", { key: value, ctrlKey: true, bubbles: true, cancelable: true }));
+  const ready = () => !document.querySelector<HTMLButtonElement>(actions("refresh"))!.disabled;
+  const text = (value: string) => document.querySelector(".device-files")?.textContent?.includes(value) === true;
+  const copied = () => calls.filter(call => call.command === "copy_device_files");
+  const submit = () => document.querySelector<HTMLFormElement>("#device-files-dialog")!.requestSubmit();
+  const rename = (index: number, name: string) => {
+    const input = document.querySelector<HTMLInputElement>(`[data-upload-name="${index}"]`)!;
+    input.value = name; input.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const openPaste = async () => { key("v"); await waitFor(() => document.querySelectorAll("[data-upload-name]").length === clipboardPaths.length, "folder rename dialog"); };
+  run.disabled = true;
+  let passed = 0;
+  try {
+    await waitFor(() => !document.querySelector<HTMLButtonElement>("#device-files-open")!.disabled, "devices loaded");
+    click("#device-files-open"); await waitFor(() => !!document.querySelector('[data-file-path="/sdcard"]'), "file root");
+    await navigate("/sdcard");
+    click('[data-file-path="/sdcard/Download"]');
+    document.querySelector('[data-file-path="/sdcard/upload.txt"]')!.dispatchEvent(new MouseEvent("click", { ctrlKey: true, bubbles: true }));
+    key("c");
+    await waitFor(() => copied().length === 1, "mixed copy IPC");
+    await waitFor(() => text("已复制 2 个项目（含文件夹）") && ready(), "mixed copy");
+    assert(copied()[0].args.deviceId === "TEST-A" && copied()[0].args.remotePaths.join("|") === "/sdcard/Download|/sdcard/upload.txt" && copied()[0].args.remoteDirectories.join() === "/sdcard/Download", "mixed copy snapshots exact files and directory hints");
+    assert(!transferCalls().length && !document.querySelector(".device-files-transfer progress"), "mixed copy doesn't eagerly pull files"); ++passed;
+
+    clipboardPaths = ["C:\\mock\\drag-project", "D:\\mock\\drag-plain.bin"];
+    clipboardDirectories.add(clipboardPaths[0]);
+    await openPaste();
+    assert(document.querySelector("#device-files-dialog")?.textContent?.includes("文件夹（包含子目录）") && document.querySelector("#device-files-dialog")?.textContent?.includes("2 个项目"), "each root has its own rename field and directory label");
+    assert(calls.filter(call => call.command === "inspect_device_upload_paths").at(-1)!.args.allowDirectories === true, "clipboard inspection explicitly permits directories");
+    click("#device-files-dialog-cancel"); assert(!transferCalls().length, "cancel uploads neither folders nor files"); ++passed;
+
+    await openPaste(); rename(0, "upload.txt"); submit();
+    await waitFor(() => !!document.querySelector("[data-upload-name]") && document.querySelector("#device-files-dialog")!.textContent!.includes("目录"), "folder vs file conflict rejected");
+    assert(!transferCalls().length && !document.querySelector("#device-files-dialog")!.textContent!.includes("覆盖设备文件？"), "directory never replaces a regular file"); ++passed;
+    rename(0, "Download"); submit(); await delay(50);
+    assert(!transferCalls().length && !!document.querySelector("[data-upload-name]"), "existing directories cannot be merged");
+    click("#device-files-dialog-cancel"); ++passed;
+
+    await openPaste(); rename(0, "clipboard-project"); rename(1, "clipboard-plain.bin"); submit();
+    await waitFor(() => transferCalls().length === 1, "mixed upload starts");
+    click('[data-picker-id="adbDevice"]'); click('[data-picker-value="TEST-B"]');
+    await waitFor(() => text("上传完成：2/2 个项目") && ready(), "mixed upload finishes");
+    assert(transferCalls().every(call => call.args.request.device_id === "TEST-A") && transferCalls().map(call => call.args.request.remote_path).join("|") === "/sdcard/clipboard-project|/sdcard/clipboard-plain.bin", "renamed mixed uploads stay bound to original device/directory");
+    assert(deviceA.get("/sdcard")!.some(item => item.path === "/sdcard/clipboard-project" && item.is_dir), "uploaded folder remains a folder"); ++passed;
+
+    await openPaste(); rename(0, "cancelled-folder"); rename(1, "not-started.bin"); submit();
+    await waitFor(() => transferCalls().length === 3 && !!document.querySelector(actions("cancel-transfer")), "mixed batch starts for cancellation");
+    click(actions("cancel-transfer"));
+    await waitFor(() => text("已取消后续上传") && ready(), "mixed batch cancellation settles");
+    assert(transferCalls().length === 3 && !deviceA.get("/sdcard")!.some(item => item.name === "cancelled-folder"), "cancelled folder isn't committed and subsequent file isn't started"); ++passed;
+
+    click('[data-file-path="/sdcard/Download"]'); failClipboardCopy = true; key("c");
+    await waitFor(() => text("simulated clipboard busy") && ready(), "directory copy failure unlocks UI");
+    assert(!text("正在读取目录结构"), "failed directory preparation doesn't leave a stale loading notice");
+    key("c"); await waitFor(() => text("已复制 1 个项目（含文件夹）") && ready(), "empty folder can be copied again"); ++passed;
+    result.textContent = `PASS：${passed} 组文件夹剪贴板回归；未访问系统剪贴板或真实设备`;
+  } catch (error) { result.textContent = `FAIL（文件夹已过 ${passed} 组）：${String(error)}`; console.error(error); }
   finally { run.disabled = false; }
 });
 

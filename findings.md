@@ -18,6 +18,12 @@
 - 用户反馈窗口拉伸时终端区域与窗口边框之间会出现黑色区域，拉伸变大后黑色区域周期性变大/消失。
 
 ## 研究发现
+- 阶段 36 验证：原生 COM 测试验证目录属性、层级相对名、空目录无需文件流以及文件索引读取；模拟 UI 覆盖混选/逐根改名、目录同名拒绝、设备绑定与取消。未操作系统剪贴板、真实 Android 或资源管理器粘贴，端到端兼容性仍需实机确认，不能将隔离测试等同真实粘贴成功。
+- 阶段 36 实现：复制目录先在后台取得 find + 批量 stat 递归清单，虚拟目录保留空目录、不请求文件流，普通文件仍延迟读取。根选择上限 256、展开清单上限 10000、相对名上限 259 UTF-16 单元；拒绝 Windows 非法名/大小写冲突/穿越/缺失父目录和链接特殊文件，失败不替换原剪贴板。
+- 阶段 36 上传：剪贴板单独允许目录并递归预检链接/重解析点和特殊文件，实际传输前可取消复检；任何涉及目录的同名目标必须改名，不自动合并覆盖。拖放入口仍只接收普通文件，避免扩大这次功能范围。
+- 阶段 36：普通文件剪贴板已实现，需将 FILEDESCRIPTOR 扩展为目录属性和安全相对路径，目录项不能提供普通文件流。上传已有目录 staging/no-replace 提交逻辑，但剪贴板入口和名称冲突判断尚只支持文件；复用传输时还需验证目录内无链接/重解析点。
+- 阶段 35 官方接口核对：OleSetClipboard 持有 IDataObject 并延迟渲染，CF_HDROP 为本地文件列表、FILEDESCRIPTOR/FILECONTENTS 为虚拟文件。退出不调用 OleFlushClipboard（会强制读取内容），只在仍拥有当前剪贴板时释放自身来源；保存 UI STA 生命周期，旧粘贴流独立持有缓存。参考：https://learn.microsoft.com/en-us/windows/win32/api/ole2/nf-ole2-olesetclipboard ，https://learn.microsoft.com/en-us/windows/win32/shell/clipboard 。
+- 阶段 35：现有 file_drag.rs 已提供敏捷 IDataObject、FILEDESCRIPTOR/FILECONTENTS、惰性 IStream、缓存和异步完成，可复用为 Windows OLE 剪贴板源。上传已有 inspect_device_upload_paths 与统一多文件改名/覆盖流程；快捷键需限定当前文件面板且避开输入框、弹窗与终端。剪贴板复制需独立于原生拖动/传输 busy 生命周期。
 - 阶段 34 完成：新增串口连接代次与 closing 标志，打开结果注册前复查；读写停止后回收线程，writer 空包唤醒避免在途 sender 让 recv 等待，Windows 重叠读写均检查停止并 CancelIoEx。CloseRequested、Destroyed、ExitRequested/Exit 共用幂等清理，Drop/关闭可恢复中毒状态锁，保留 Android/文件传输原有清理。39 项后端、15 项前端逻辑及类型/格式/编译检查通过；测试未操作实际串口，未打包 EXE。
 - 阶段 34 确认：串口 reader 句柄 DuplicateHandle 使用 TRUE（可继承）；reader 等待不检查停止标志。关闭流程已有 join，但仅绑定 CloseRequested，缺少应用 ExitRequested/Exit 及 Destroyed 兜底。将打开与登记用代次检查隔离，退出时设置永久关闭标志，读写都支持停止，并保证清理可重复调用。
 - 阶段 34 初查：已有窗口 CloseRequested 调用 close_serial_manager，SerialManager::drop 也调用 close_locked；connect 在释放状态锁后打开串口并启动线程，随后再注册句柄，需核对退出/断开期间的竞态。Windows reader 的重叠读取当前未传停止标志，DuplicateHandle 的继承参数为 TRUE，继续确认清理完整性。
@@ -157,6 +163,10 @@
 - 本地 `serial_terminal` Tauri 项目。
 
 ## 视觉/浏览器发现
+- 阶段 35 最终视觉：`device-files-clipboard.png` 为模拟设备、多选两文件场景。菜单完整显示复制（Ctrl+C）/粘贴（Ctrl+V），图标/颜色/圆角沿用终端菜单；多选仍禁用原单项下载和重命名。全部隔离验证通过，未将 COM/浏览器模拟结果冒充真实 Windows 资源管理器与 Android 的端到端验收。
+- 阶段 35：7 组侧栏 ADB 回归也通过；最终新旧浏览器回归为 10 + 25/17/12/11/7 组，均为模拟环境。正核对文件页主题右键菜单中的 Ctrl+C / Ctrl+V 入口，后续清理仅关闭本轮测试页与服务器。
+- 阶段 35 兼容性：12 组框选/删除/进度、11 组侧键回归通过；已有传输终态收起与目录历史不受剪贴板快捷键影响。原生粘贴进度由 Windows 处理，不在应用里制造等待粘贴的 busy 动画；原生状态仅按 deviceId/copyId 路由到对应文件页。
+- 阶段 35：10 组新增剪贴板交互、25 组目录/菜单与 17 组拖放 UI 回归通过。文件复制只发布虚拟文件，不产生等待粘贴的无限进度；上传沿用统一名称确认，批量传输绑定原文件标签设备，不跟随侧栏改选。输入框 Ctrl+C/V 和终端不会被当作文件上传。
 - 阶段 33 后续布局调整：按用户要求，最终为第一排 ROOT / REMOUNT、第二排 SYNC / 浏览文件。已更新两处 UI 布局断言；此次完成前端构建、测试类型检查和 15 项逻辑测试，未重跑浏览器视觉回归，旧截图仅对应调整前布局。后续默认不再生成最终 EXE。
 - 阶段 33 视觉确认：`adb-remount-sync-buttons.png`（模拟设备）显示 ADB REMOUNT / ADB SYNC 与上排 ROOT/浏览文件等宽、同主题且对齐；新按钮继承全局 :active 的阴影、亮度与下压效果。已构建新版独立 EXE，未执行任何真实设备挂载或刷盘命令。
 - 阶段 33 验证：7 组新增按钮与 25 组原有文件管理回归、29 项后端（含新命令 argv）和 15 项前端逻辑均通过；EXE 已构建。ADB REMOUNT / ADB SYNC 每次点击的目标固定为点击时所选设备，不绑定文件标签设备；文件页原有刷盘行为没有改动。
