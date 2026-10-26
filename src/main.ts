@@ -2420,12 +2420,9 @@ function syncRemoteAdbInputWithSelectedDevice(force: boolean): void {
   }
 
   state.selectedRemoteAdb = "";
-  if (!hasRemoteAdbDevice()) {
-    if (force || !normalizeRemoteAdbAddress(state.remoteAdbInput)) {
-      state.remoteAdbInput = defaultRemoteAdbAddress;
-    }
-  } else if (force) {
-    state.remoteAdbInput = "";
+  // Selecting a local device must not clear or replace the address being edited.
+  if (!hasRemoteAdbDevice() && !normalizeRemoteAdbAddress(state.remoteAdbInput)) {
+    state.remoteAdbInput = defaultRemoteAdbAddress;
   }
 }
 
