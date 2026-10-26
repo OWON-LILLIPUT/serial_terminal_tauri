@@ -430,6 +430,24 @@ function restoreSidebarScroll(): void {
   }
 }
 
+function remoteAdbInputParts(value: string): string[] {
+  if (!value) return ["", "", "", "", ""];
+  const match = /^(\d*)\.(\d*)\.(\d*)\.(\d*)(?::([^:]*))?$/.exec(value);
+  return match ? [...match.slice(1, 5), match[5] ?? "5555"] : [value];
+}
+
+function renderRemoteAdbInput(): string {
+  const parts = remoteAdbInputParts(state.remoteAdbInput);
+  return `<div id="remote-adb-inputs" class="remote-adb-address ${parts.length === 1 ? "single-address" : ""}" role="group" aria-label="远程 ADB 地址">
+    ${parts.map((part, index) => `${index ? `<span aria-hidden="true">${index === 4 ? ":" : "."}</span>` : ""}<input
+      id="remote-adb-address${index ? `-${index}` : ""}"
+      class="text-input remote-adb-part" type="text" spellcheck="false" autocomplete="off"
+      aria-label="${parts.length === 1 ? "远程 ADB 地址" : index === 4 ? "端口" : `IP 第 ${index + 1} 段` }"
+      value="${escapeAttribute(part)}" ${state.adbBusy ? "disabled" : ""}
+    />`).join("")}
+  </div>`;
+}
+
 function renderAndroidSections(): string {
   const remoteAddress = remoteAdbToggleAddress();
   const remoteConnected = remoteAddress ? remoteAdbStatus(remoteAddress) === "device" : false;
@@ -461,7 +479,7 @@ function renderAndroidSections(): string {
           </button>
         </div>
       </label>
-      <label class="field">
+      <div class="field">
         <span class="field-label-row">
           <span>远程 ADB IP</span>
           <span
@@ -472,17 +490,8 @@ function renderAndroidSections(): string {
             ${escapeHtml(state.remoteAdbMessage)}
           </span>
         </span>
-        <input
-          id="remote-adb-address"
-          class="text-input"
-          type="text"
-          spellcheck="false"
-          autocomplete="off"
-          placeholder="${defaultRemoteAdbAddress}"
-          value="${escapeAttribute(state.remoteAdbInput)}"
-          ${state.adbBusy ? "disabled" : ""}
-        />
-      </label>
+        ${renderRemoteAdbInput()}
+      </div>
       <div class="scrcpy-options-row">
         <label class="field compact-field">
           <span>视频编码</span>
@@ -877,19 +886,35 @@ function bindChromeEvents(): void {
   });
 }
 
+function bindRemoteAdbInputEvents(): void {
+  const inputs = [...document.querySelectorAll<HTMLInputElement>("#remote-adb-inputs input")];
+  inputs.forEach((input) => {
+    input.addEventListener("focus", () => input.select());
+    input.addEventListener("pointerdown", (event) => {
+      if (event.button === 0 && document.activeElement !== input) {
+        event.preventDefault();
+        input.focus();
+        input.select();
+      }
+    });
+    input.addEventListener("input", () => {
+      const values = inputs.map((field) => field.value);
+      state.remoteAdbInput = values.length === 1 ? values[0] : values.every((value) => !value)
+        ? "" : `${values.slice(0, 4).join(".")}:${values[4]}`;
+      state.remoteAdbMessage = "";
+      updateAndroidControls();
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void toggleRemoteAdb();
+      }
+    });
+  });
+}
+
 function bindAndroidEvents(): void {
-  const remoteAdbAddress = document.querySelector<HTMLInputElement>("#remote-adb-address");
-  remoteAdbAddress?.addEventListener("input", () => {
-    state.remoteAdbInput = remoteAdbAddress.value;
-    state.remoteAdbMessage = "";
-    updateAndroidControls();
-  });
-  remoteAdbAddress?.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      void toggleRemoteAdb();
-    }
-  });
+  bindRemoteAdbInputEvents();
 
   document.querySelector("#adb-toggle")?.addEventListener("click", () => {
     void toggleRemoteAdb();
@@ -1766,13 +1791,17 @@ function updateAndroidControls(): void {
     adbToggle.classList.toggle("danger-button", remoteConnected);
   }
 
-  const remoteAdbAddress = document.querySelector<HTMLInputElement>("#remote-adb-address");
-  if (remoteAdbAddress) {
-    remoteAdbAddress.disabled = state.adbBusy;
-    if (document.activeElement !== remoteAdbAddress) {
-      remoteAdbAddress.value = state.remoteAdbInput;
+  let remoteAdbInputs = [...document.querySelectorAll<HTMLInputElement>("#remote-adb-inputs input")];
+  const remoteParts = remoteAdbInputParts(state.remoteAdbInput);
+  if (!isRemoteAdbInputActive()) {
+    if (remoteAdbInputs.length && remoteAdbInputs.length !== remoteParts.length) {
+      document.querySelector("#remote-adb-inputs")!.outerHTML = renderRemoteAdbInput();
+      bindRemoteAdbInputEvents();
+      remoteAdbInputs = [...document.querySelectorAll<HTMLInputElement>("#remote-adb-inputs input")];
     }
+    remoteAdbInputs.forEach((input, index) => { input.value = remoteParts[index]; });
   }
+  remoteAdbInputs.forEach((input) => { input.disabled = state.adbBusy; });
   updateTextWithTitle("#remote-adb-inline-status", state.remoteAdbMessage);
 
   const refreshScrcpyDevices =
@@ -2367,7 +2396,7 @@ function hasRemoteAdbDevice(): boolean {
 }
 
 function isRemoteAdbInputActive(): boolean {
-  return document.activeElement?.id === "remote-adb-address";
+  return !!document.activeElement?.closest("#remote-adb-inputs");
 }
 
 function syncRemoteAdbInputWithSelectedDevice(force: boolean): void {

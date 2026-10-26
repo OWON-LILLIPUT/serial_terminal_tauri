@@ -549,6 +549,24 @@ select,
   background: var(--surface-0);
 }
 
+.remote-adb-address {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1.5fr);
+  align-items: center;
+  gap: calc(3px * var(--ui-scale));
+  min-width: 0;
+}
+
+.remote-adb-address.single-address {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.remote-adb-part {
+  padding: 0 calc(2px * var(--ui-scale));
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 select:focus,
 input:focus,
 button:focus-visible,
