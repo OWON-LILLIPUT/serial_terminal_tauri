@@ -490,8 +490,8 @@ export class DeviceFiles {
       document.querySelectorAll<HTMLElement>("[data-files-expand]").forEach(button => button.addEventListener("click", () => { void this.expand(session, button.dataset.filesExpand!); }));
       document.querySelector(".device-files")?.addEventListener("contextmenu", event => {
         const mouse = event as MouseEvent;
-        const target = mouse.target as Element;
-        if (target.closest("input, textarea") || this.dialog) return;
+        const target = mouse.target instanceof Element ? mouse.target : null;
+        if (!target?.closest(".device-files-list, .device-files-tree") || target.closest("input, textarea, [contenteditable]") || this.dialog) return;
         mouse.preventDefault(); mouse.stopPropagation();
         const row = target.closest<HTMLElement>("[data-file-path]");
         const treeRow = target.closest<HTMLElement>(".device-files-tree-row");

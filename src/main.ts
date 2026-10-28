@@ -2816,6 +2816,11 @@ window.addEventListener("resize", () => {
   queueFit();
 });
 
+// Disable the WebView's default menu without blocking supported custom menus.
+document.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+}, { capture: true });
+
 document.addEventListener("pointerdown", (event) => {
   const target = event.target;
   let shouldRender = false;
