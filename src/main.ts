@@ -581,6 +581,7 @@ function createTerminalSession(
     scrollback: 10000,
     smoothScrollDuration: 0,
     theme: terminalTheme(),
+    windowOptions: { getWinSizeChars: true },
   });
   const sessionFitAddon = new FitAddon();
   const session: TerminalSession = {
@@ -599,6 +600,9 @@ function createTerminalSession(
   };
 
   sessionTerminal.loadAddon(sessionFitAddon);
+  if (kind === "adbShell") {
+    sessionTerminal.onResize(() => queueAdbShellText(session, ""));
+  }
   sessionTerminal.attachCustomKeyEventHandler((event) => {
     if (event.type === "keydown" && event.ctrlKey && event.key.toLowerCase() === "c") {
       if (sessionTerminal.hasSelection()) {
@@ -806,7 +810,7 @@ function queueTerminalText(session: TerminalSession, text: string): void {
   }
 
   if (session.deviceId) {
-    queueAdbShellText(session.deviceId, normalizeAdbShellInput(text));
+    queueAdbShellText(session, normalizeAdbShellInput(text));
   }
 }
 
@@ -1651,9 +1655,17 @@ async function openAdbShell(): Promise<void> {
   renderApp();
 
   try {
-    const result = await invoke<AdbShellStartPayload>("start_adb_shell", { deviceId });
-    const activeShell = ensureAdbShellSession(result.device_id, true, true, result.shell_id);
-    activeShell.terminal.writeln(`\x1b[32mADB Shell 已打开: ${result.device_id}\x1b[0m`);
+    session.fitAddon.fit();
+    const result = await invoke<AdbShellStartPayload>("start_adb_shell", {
+      deviceId,
+      size: { cols: session.terminal.cols, rows: session.terminal.rows },
+    });
+    // A PTY can exit before the start response reaches the webview.
+    if (!session.closed || session.shellId !== result.shell_id) {
+      const activeShell = ensureAdbShellSession(result.device_id, true, true, result.shell_id);
+      queueAdbShellText(activeShell, "");
+      activeShell.terminal.writeln(`\x1b[32mADB Shell 已打开: ${result.device_id}\x1b[0m`);
+    }
   } catch (error) {
     state.androidError = toMessage(error);
     removeAdbShellSession(deviceId);
@@ -1708,7 +1720,7 @@ function handleAdbShellExit(deviceId: string, shellId: number, message: string):
   state.adbShellDevices = state.adbShellDevices.filter((entry) => entry !== deviceId);
   if (session) {
     session.closed = true;
-    session.shellId = undefined;
+    session.shellId = shellId;
     session.title = adbShellTitle(deviceId, true);
     session.terminal.writeln(`\r\n\x1b[90m${message}\x1b[0m`);
   }
@@ -1731,6 +1743,7 @@ function queueAdbShellOutput(
   if (existingSession?.shellId !== undefined && existingSession.shellId !== shellId) {
     return;
   }
+  if (existingSession?.closed) return;
 
   const session = ensureAdbShellSession(deviceId, false, true, shellId);
   if (!existed) {
@@ -1739,19 +1752,23 @@ function queueAdbShellOutput(
   queueTerminalOutput(session, data, byteCount);
 }
 
-function queueAdbShellText(deviceId: string, text: string): void {
-  if (!isAdbShellRunning(deviceId) || text.length === 0) {
+function queueAdbShellText(session: TerminalSession, text: string): void {
+  const { deviceId, shellId, terminal } = session;
+  if (!deviceId || shellId === undefined || session.closed || !isAdbShellRunning(deviceId)) {
     return;
   }
 
-  void invoke<void>("write_adb_shell", { deviceId, text }).catch((error) => {
+  void invoke<void>("write_adb_shell", {
+    deviceId,
+    shellId,
+    text,
+    size: { cols: terminal.cols, rows: terminal.rows },
+  }).catch((error) => {
+    if (terminalSessions.get(session.id) !== session || session.shellId !== shellId || session.closed) return;
     const message = toMessage(error);
-    const session = terminalSessions.get(adbShellTerminalId(deviceId));
-    if (session) {
-      session.terminal.writeln(`\r\n\x1b[31m${message}\x1b[0m`);
-      session.closed = true;
-      session.title = adbShellTitle(deviceId, true);
-    }
+    session.terminal.writeln(`\r\n\x1b[31m${message}\x1b[0m`);
+    session.closed = true;
+    session.title = adbShellTitle(deviceId, true);
     state.adbShellDevices = state.adbShellDevices.filter((entry) => entry !== deviceId);
     state.androidError = message;
     renderApp();

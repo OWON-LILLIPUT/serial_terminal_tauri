@@ -92,15 +92,15 @@ impl AdbServerManager {
 }
 
 pub fn server_is_running() -> bool {
-    let Some(endpoint) = server_endpoint(
+    tcp_endpoint().is_some_and(|endpoint| server_responds_at(&endpoint))
+}
+
+pub fn tcp_endpoint() -> Option<String> {
+    server_endpoint(
         env::var("ADB_SERVER_SOCKET").ok().as_deref(),
         env::var("ANDROID_ADB_SERVER_ADDRESS").ok().as_deref(),
         env::var("ANDROID_ADB_SERVER_PORT").ok().as_deref(),
-    ) else {
-        // Let adb start-server handle non-TCP sockets or unsupported configuration.
-        return false;
-    };
-    server_responds_at(&endpoint)
+    )
 }
 
 fn server_endpoint(socket: Option<&str>, host: Option<&str>, port: Option<&str>) -> Option<String> {

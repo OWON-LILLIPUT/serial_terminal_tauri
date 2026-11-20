@@ -31,6 +31,9 @@ let clipboardPaths = ["C:\\mock\\drag-clip-a.txt", "D:\\mock\\drag-clip-b.bin"];
 let failClipboardRead = false;
 let failClipboardCopy = false;
 const clipboardDirectories = new Set<string>();
+let reportedSerialColumns = 0;
+let mockAdbColumns = 0;
+const promptPrefix = "$ ls /data/";
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 localStorage.setItem("serial-terminal-settings-v1", JSON.stringify({ selectedAdbDevice: "TEST-A" }));
 mockWindows("main");
@@ -38,6 +41,28 @@ mockIPC(async (command, args: any = {}) => {
   calls.push({ command, args: structuredClone(args) });
   if (command === "list_fonts") return ["Consolas", "Cascadia Mono"];
   if (command === "list_ports") return ["COM5"];
+  if (command === "start_adb_shell") {
+    mockAdbColumns = args.size.cols;
+    return { device_id: args.deviceId, shell_id: 1 };
+  }
+  if (command === "write_adb_shell" || command === "write_text") {
+    const isAdb = command === "write_adb_shell";
+    if (isAdb && !args.text) mockAdbColumns = args.size.cols;
+    if (!isAdb) {
+      const report = /^\x1b\[8;\d+;(\d+)t$/.exec(args.text);
+      if (report) reportedSerialColumns = Number(report[1]);
+    }
+    if (args.text === "\t") {
+      const cols = isAdb ? mockAdbColumns : reportedSerialColumns;
+      const line = promptPrefix + "directory/".repeat(8) + "completed";
+      const wrappedRows = Math.floor((line.length - 1) / cols);
+      const data = `\r\x1b[J${line}\x1b[${wrappedRows}A\r\x1b[5C`;
+      const payload = { data: btoa(data), byte_count: data.length };
+      if (isAdb) await emit("adb-shell-data", { ...payload, device_id: args.deviceId, shell_id: args.shellId });
+      else await emit("serial-data", payload);
+    }
+    return null;
+  }
   if (command === "list_adb_state") return { devices: hideAdbDevices ? [] : ["TEST-A", "TEST-B"].map(id => ({ id, state: id === "TEST-A" && !deviceAOnline ? "offline" : "device", is_remote: false })), scrcpy_devices: [] };
   if (["adb_root", "adb_remount", "adb_sync"].includes(command)) {
     const failure = failNextAdbAction; failNextAdbAction = "";
@@ -973,6 +998,54 @@ document.querySelector("#run-folder-clipboard-tests")!.addEventListener("click",
     result.textContent = `PASS：${passed} 组文件夹剪贴板回归；未访问系统剪贴板或真实设备`;
   } catch (error) { result.textContent = `FAIL（文件夹已过 ${passed} 组）：${String(error)}`; console.error(error); }
   finally { run.disabled = false; }
+});
+
+document.querySelector("#run-terminal-resize-tests")!.addEventListener("click", async () => {
+  const result = document.querySelector("#ui-test-result")!;
+  const layout = document.createElement("style");
+  document.head.append(layout);
+  const fit = (width: number) => { layout.textContent = `.terminal-panel { width: ${width}px; }`; };
+  const tab = () => {
+    const input = document.querySelector<HTMLTextAreaElement>("#terminal-host .xterm-helper-textarea")!;
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", code: "Tab", keyCode: 9, bubbles: true, cancelable: true }));
+  };
+  const cursorOnPrompt = () => document.querySelector("#terminal-host .xterm-cursor")?.parentElement?.textContent?.startsWith(promptPrefix) === true;
+  const query = async () => {
+    reportedSerialColumns = 0;
+    await emit("serial-data", { data: btoa("\x1b[18t"), byte_count: 5 });
+    await waitFor(() => reportedSerialColumns > 0, "serial shell receives terminal size report");
+    return reportedSerialColumns;
+  };
+  try {
+    fit(1400);
+    await waitFor(() => !document.querySelector<HTMLButtonElement>("#adb-shell-open")!.disabled && !!document.querySelector("#terminal-host .xterm-cursor"), "mock devices and terminal ready");
+    click("#connection-toggle");
+    await waitFor(() => document.querySelector("#connection-toggle")?.textContent?.includes("关闭串口") === true, "serial connected");
+    const wideSerial = await query();
+    fit(380);
+    await delay(80);
+    const narrowSerial = await query();
+    assert(wideSerial > 80 && narrowSerial < 50, "serial reply follows actual window width");
+    tab();
+    await waitFor(cursorOnPrompt, "serial completion redraw moves cursor to its intended row");
+
+    fit(1400);
+    click("#adb-shell-open");
+    await waitFor(() => mockAdbColumns > 80, "ADB starts with fitted size");
+    fit(380);
+    await waitFor(() => mockAdbColumns < 50, "ADB gets smaller size before input");
+    tab();
+    await waitFor(cursorOnPrompt, "ADB completion redraw moves cursor to its intended row");
+    fit(1400);
+    await waitFor(() => mockAdbColumns > 80, "ADB size returns to wide layout");
+    result.textContent = "PASS：终端随窗口缩放，串口尺寸查询和 ADB 尺寸通知回归通过";
+  } catch (error) {
+    result.textContent = `FAIL：${String(error)}`;
+    console.error(error);
+  } finally {
+    layout.remove();
+  }
 });
 
 document.querySelector("#run-adb-actions-tests")!.addEventListener("click", async () => {

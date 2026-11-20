@@ -18,6 +18,8 @@
 - 用户反馈窗口拉伸时终端区域与窗口边框之间会出现黑色区域，拉伸变大后黑色区域周期性变大/消失。
 
 ## 研究发现
+- 阶段 38 更正：用户要求列数实际随窗口变小，撤销最小 80 列及横向滚动。Windows CLI 的输出是管道时无法调用 GetConsoleScreenBufferInfo 获取尺寸，Windows 客户端也不通过 SIGWINCH 更新。使用 ADB server 的 shell v2 PTY，在打开时及后续缩放时发送 WindowSizeChange 帧，和键盘字节共用发送队列。串口协议不携带 PTY 尺寸，启用 xterm 的 `CSI 18 t` 实际行列查询响应。实机端是否会请求或应用该尺寸取决于 Shell。参考 https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/client/commandline.cpp 和 https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/daemon/shell_service.cpp 。
+- 阶段 38：前端的 FitAddon 随终端容器收窄列数，串口仅传输字节。ADB Shell 使用 `-tt` 和重定向管道，Windows ADB 客户端从控制台查询宽度失败时不会发送尺寸；mksh 无有效尺寸时按 80 列重绘。以 80 列 Shell 回显验证显示错位，并采用最少 80 列加横向滚动。参考 https://android.googlesource.com/platform/system/core/+/19322dddc67223a5ff9932945fb0ea4147505e55/adb/client/commandline.cpp 和 https://android.googlesource.com/platform/external/mksh/+/95541002559cd8834d7093898453dcb3f5061b6e/src/var.c 。
 - 阶段 37（按用户澄清收窄）：仅拆输入框外观，四段 IP 加一段端口，点击或 Tab 聚焦时选中该段；组合回原地址字符串，沿用历史回填、连接与默认端口逻辑，不加格式校验/整地址粘贴/自动跳转。已有主机名或 IPv6 地址仍沿用单框显示，避免丢失内容。
 - 阶段 36 验证：原生 COM 测试验证目录属性、层级相对名、空目录无需文件流以及文件索引读取；模拟 UI 覆盖混选/逐根改名、目录同名拒绝、设备绑定与取消。未操作系统剪贴板、真实 Android 或资源管理器粘贴，端到端兼容性仍需实机确认，不能将隔离测试等同真实粘贴成功。
 - 阶段 36 实现：复制目录先在后台取得 find + 批量 stat 递归清单，虚拟目录保留空目录、不请求文件流，普通文件仍延迟读取。根选择上限 256、展开清单上限 10000、相对名上限 259 UTF-16 单元；拒绝 Windows 非法名/大小写冲突/穿越/缺失父目录和链接特殊文件，失败不替换原剪贴板。
