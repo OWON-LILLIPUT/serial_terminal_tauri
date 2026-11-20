@@ -84,6 +84,7 @@ impl Drop for SerialManager {
 struct SerialState {
     closing: bool,
     generation: u64,
+    port_name: Option<String>,
     reader_stop: Option<Arc<AtomicBool>>,
     reader: Option<JoinHandle<()>>,
     writer_stop: Option<Arc<AtomicBool>>,
@@ -305,6 +306,7 @@ fn connect(
             let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>();
             let writer_stop = Arc::new(AtomicBool::new(false));
             let reader_stop = Arc::new(AtomicBool::new(false));
+            state.port_name = Some(config.port_name.clone());
             state.reader_stop = Some(Arc::clone(&reader_stop));
             state.writer_stop = Some(Arc::clone(&writer_stop));
             state.writer_tx = Some(writer_tx);
@@ -395,6 +397,59 @@ fn write_text(manager: State<'_, SerialManager>, text: String) -> Result<(), Str
         .map_err(|_| "串口写入通道已关闭".to_string())?;
 
     Ok(())
+}
+
+#[tauri::command]
+async fn sync_serial_terminal_size(
+    app: AppHandle,
+    port_name: String,
+    device_id: String,
+    size: TerminalSize,
+) -> Result<(), String> {
+    let device_id = normalize_device_id(&device_id)?;
+    let TerminalSize { rows, cols } = size;
+    if rows == 0 || cols == 0 {
+        return Err("终端行列数必须大于零".to_string());
+    }
+
+    run_android_task(app, move |app, android| {
+        let adb_path = ensure_adb_server_started(app, android)?;
+        let serial = app.state::<SerialManager>();
+        if serial
+            .inner
+            .lock()
+            .map_err(|_| "串口状态锁已损坏".to_string())?
+            .port_name
+            .as_deref()
+            != Some(port_name.as_str())
+        {
+            return Err("绑定的串口未打开".to_string());
+        }
+
+        // UART has no window-size message. Set the console tty size over ADB
+        // so the serial shell keeps its current input line.
+        let command = format!(
+            r#"
+tty=$(getprop ro.boot.console)
+case "$tty" in
+    ""|*[!a-zA-Z0-9_]*) echo '无法识别 Android 串口控制台' >&2; exit 1 ;;
+esac
+if [ ! -c "/dev/$tty" ]; then
+    echo 'Android 串口控制台不存在' >&2
+    exit 1
+fi
+set -- -F "/dev/$tty" rows {rows} cols {cols}
+stty "$@" 2>/dev/null || su 0 stty "$@"
+"#
+        );
+        run_adb_command_with_path(
+            &adb_path,
+            &["-s", &device_id, "shell", &command],
+            ADB_COMMAND_TIMEOUT_MS,
+        )?;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1186,6 +1241,7 @@ fn emit_serial_data(app: &AppHandle, pending: &mut Vec<u8>) {
 
 fn close_locked(state: &mut SerialState) {
     state.generation = state.generation.wrapping_add(1);
+    state.port_name = None;
     if let Some(reader_stop) = state.reader_stop.take() {
         reader_stop.store(true, Ordering::Relaxed);
     }
@@ -1791,6 +1847,7 @@ pub fn run() {
             connect,
             disconnect,
             write_text,
+            sync_serial_terminal_size,
             report_perf,
             adb_connect,
             adb_disconnect,

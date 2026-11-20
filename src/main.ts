@@ -19,7 +19,7 @@ type PickerId =
   | "adbDevice"
   | "scrcpyCodec";
 type ScrcpyVideoCodec = "h264" | "h265";
-type TerminalContextMenuAction = "copy" | "paste" | "clear";
+type TerminalContextMenuAction = "copy" | "paste" | "clear" | "serial-size-auto";
 type TerminalSessionKind = "serial" | "adbShell";
 type ResizeDirection =
   | "North"
@@ -44,6 +44,7 @@ interface TerminalContextMenuState {
   top: number;
   canCopy: boolean;
   canPaste: boolean;
+  showSerialSize: boolean;
 }
 
 interface TerminalSession {
@@ -68,6 +69,20 @@ interface SerialConfig {
   data_bits: number;
   parity: Parity;
   stop_bits: number;
+}
+
+interface SerialSizeBinding {
+  portName: string;
+  deviceId: string;
+}
+
+interface SerialResizeEdge {
+  cols: number;
+  line: number;
+  contents: string;
+  lastCell: string;
+  redrawing: boolean;
+  previousByte: number;
 }
 
 interface SerialDataPayload {
@@ -128,6 +143,8 @@ interface AppState {
   ports: string[];
   availableFonts: string[];
   config: SerialConfig;
+  serialSizeSyncEnabled: boolean;
+  serialSizeBinding?: SerialSizeBinding;
   mode: ConnectionMode;
   rxBytes: number;
   txBytes: number;
@@ -158,6 +175,8 @@ interface AppState {
 
 interface SavedSettings {
   config?: Partial<SerialConfig>;
+  serialSizeSyncEnabled?: boolean;
+  serialSizeBinding?: SerialSizeBinding;
   fontFamily?: string;
   fontSize?: number;
   lineSpacing?: number;
@@ -200,6 +219,7 @@ const serialTerminalId = "serial";
 const serialWriteChunkSize = 64;
 const serialWriteMaxChunksPerPump = 4;
 const serialWriteMaxInFlight = 8;
+const serialSizeSyncDelayMs = 150;
 const terminalOutputChunkBytes = 64 * 1024;
 const perfWarnMs = 50;
 const mainThreadLagWarnMs = 120;
@@ -216,6 +236,8 @@ const state: AppState = {
     parity: savedSettings.config?.parity ?? "none",
     stop_bits: savedSettings.config?.stop_bits ?? 1,
   },
+  serialSizeSyncEnabled: savedSettings.serialSizeSyncEnabled !== false,
+  serialSizeBinding: savedSettings.serialSizeBinding,
   mode: "disconnected",
   rxBytes: 0,
   txBytes: 0,
@@ -266,6 +288,11 @@ let pendingSerialText = "";
 let serialWritePumpQueued = false;
 let serialWritePumpTimer: number | null = null;
 let serialWritesInFlight = 0;
+let serialSizeSyncTimer: number | undefined;
+let serialSizeSyncRunning = false;
+let serialSizeSyncAttempt: { rows: number; cols: number } | undefined;
+let serialSizeSyncError = "";
+let serialResizeEdge: SerialResizeEdge | undefined;
 let terminalContextMenu: TerminalContextMenuState | null = null;
 let pendingStatsUpdate = false;
 let lastPerfReportAt = 0;
@@ -372,6 +399,9 @@ function renderApp(): void {
               ${connectionButtonText()}
             </button>
             ${state.lastError ? `<div class="error-text">${escapeHtml(state.lastError)}</div>` : ""}
+            <div id="serial-size-sync-error" class="error-text" ${serialSizeSyncError ? "" : "hidden"}>
+              ${escapeHtml(serialSizeSyncError)}
+            </div>
           </section>
 
           ${renderAndroidSections()}
@@ -965,6 +995,7 @@ function renderTerminalContextMenu(): string {
     return "";
   }
 
+  const binding = currentSerialSizeBinding();
   return `
     <div
       id="terminal-context-menu"
@@ -994,18 +1025,27 @@ function renderTerminalContextMenu(): string {
         <span class="terminal-context-icon">&#xE74D;</span>
         <span>清空</span>
       </button>
+      ${terminalContextMenu.showSerialSize ? `
+        <button data-terminal-menu-action="serial-size-auto" class="terminal-context-item" type="button"
+          title="${escapeHtml(binding ? `已绑定 ADB 设备 ${binding.deviceId}` : "使用当前选中的 ADB 设备自动同步行列数")}">
+          <span class="terminal-context-icon" aria-hidden="true">&#xE740;</span>
+          <span>${state.serialSizeSyncEnabled ? "关闭自动尺寸同步" : "启用自动尺寸同步"}</span>
+        </button>
+      ` : ""}
     </div>
   `;
 }
 
 function openTerminalContextMenu(clientX: number, clientY: number): void {
-  const menuSize = terminalContextMenuSize();
   const session = activeTerminalSession();
+  const showSerialSize = session.kind === "serial";
+  const menuSize = terminalContextMenuSize(showSerialSize ? 4 : 3);
   terminalContextMenu = {
     left: clamp(clientX, terminalMenuMargin, window.innerWidth - menuSize.width - terminalMenuMargin),
     top: clamp(clientY, terminalMenuMargin, window.innerHeight - menuSize.height - terminalMenuMargin),
     canCopy: session.terminal.hasSelection(),
     canPaste: canPasteToTerminal(session),
+    showSerialSize,
   };
   renderApp();
   focusActiveTerminal();
@@ -1020,16 +1060,16 @@ function closeTerminalContextMenu(): boolean {
   return true;
 }
 
-function terminalContextMenuSize(): { width: number; height: number } {
+function terminalContextMenuSize(itemCount: number): { width: number; height: number } {
   const scale = currentScale();
   const width = clamp(172 * scale, 136, 172);
   const itemHeight = clamp(34 * scale, 28, 34);
   const padding = 8 * scale;
-  const itemGap = 4;
+  const itemGap = 2;
 
   return {
     width,
-    height: itemHeight * 3 + padding + itemGap,
+    height: itemHeight * itemCount + padding + itemGap * (itemCount - 1) + 2,
   };
 }
 
@@ -1049,6 +1089,19 @@ async function runTerminalContextMenuAction(action: TerminalContextMenuAction): 
     closeTerminalContextMenu();
     renderApp();
     await pasteFromClipboard();
+    return;
+  }
+
+  if (action === "serial-size-auto") {
+    state.serialSizeSyncEnabled = !state.serialSizeSyncEnabled;
+    if (!state.serialSizeSyncEnabled) {
+      state.serialSizeBinding = undefined;
+    }
+    resetSerialSizeSync();
+    saveSettings();
+    closeTerminalContextMenu();
+    renderApp();
+    focusActiveTerminal();
     return;
   }
 
@@ -1502,6 +1555,7 @@ async function refreshScrcpyState(shouldRender = false): Promise<void> {
 }
 
 function applyAndroidState(androidState: AndroidStatePayload): void {
+  const previousSizeDevice = onlineSerialSizeDeviceId();
   state.adbDevices = androidState.devices;
   applyScrcpyDevices(androidState.scrcpy_devices);
 
@@ -1515,6 +1569,10 @@ function applyAndroidState(androidState: AndroidStatePayload): void {
   }
   syncRemoteAdbInputWithSelectedDevice(false);
 
+  if (previousSizeDevice !== onlineSerialSizeDeviceId()) {
+    resetSerialSizeSync();
+    queueFit();
+  }
   saveSettings();
 }
 
@@ -1898,6 +1956,7 @@ async function connectSerial(): Promise<void> {
 
   state.mode = "connecting";
   state.lastError = "";
+  resetSerialSizeSync();
   clearPendingSerialText();
   clearPendingTerminalOutput();
   renderApp();
@@ -1927,6 +1986,7 @@ async function disconnectSerial(): Promise<void> {
   }
 
   state.mode = "disconnected";
+  resetSerialSizeSync();
   terminal.writeln("\x1b[90m串口已关闭\x1b[0m");
   renderApp();
 }
@@ -2001,6 +2061,7 @@ async function writeSerialChunk(text: string): Promise<void> {
 
     state.lastError = toMessage(error);
     state.mode = "error";
+    resetSerialSizeSync();
     clearPendingSerialText();
     clearPendingTerminalOutput();
     terminal.writeln(`\x1b[31m${state.lastError}\x1b[0m`);
@@ -2084,11 +2145,138 @@ function queueFit(): void {
     fitQueued = false;
     if (deviceFiles.has(state.activeTerminalId)) return;
     try {
+      const previousCols = terminal.cols;
       activeTerminalSession().fitAddon.fit();
+      if (terminal.cols !== previousCols) {
+        serialResizeEdge = terminal.cols < previousCols ? captureSerialResizeEdge() : undefined;
+      }
+      queueSerialSizeSync();
     } catch {
       // The fit addon can run before the terminal has completed its first layout pass.
     }
   });
+}
+
+function currentSerialSizeBinding(): SerialSizeBinding | undefined {
+  const binding = state.serialSizeBinding;
+  return binding?.portName === state.config.port_name ? binding : undefined;
+}
+
+function onlineSerialSizeDeviceId(): string | undefined {
+  if (!state.serialSizeSyncEnabled) return undefined;
+  const deviceId = currentSerialSizeBinding()?.deviceId ?? state.selectedAdbDevice;
+  return adbDeviceState(deviceId) === "device" ? deviceId : undefined;
+}
+
+function serialSizeSyncTarget(): SerialSizeBinding | undefined {
+  if (state.mode !== "connected" || state.activeTerminalId !== serialTerminalId) return undefined;
+  const deviceId = onlineSerialSizeDeviceId();
+  return deviceId ? { portName: state.config.port_name, deviceId } : undefined;
+}
+
+function queueSerialSizeSync(): void {
+  if (!serialSizeSyncTarget() ||
+      (serialSizeSyncAttempt?.rows === terminal.rows && serialSizeSyncAttempt.cols === terminal.cols)) {
+    return;
+  }
+  window.clearTimeout(serialSizeSyncTimer);
+  serialSizeSyncTimer = window.setTimeout(() => {
+    serialSizeSyncTimer = undefined;
+    void syncSerialSize();
+  }, serialSizeSyncDelayMs);
+}
+
+async function syncSerialSize(): Promise<void> {
+  const binding = serialSizeSyncTarget();
+  if (!binding || serialSizeSyncRunning) return;
+  const { rows, cols } = terminal;
+  if (serialSizeSyncAttempt?.rows === rows && serialSizeSyncAttempt.cols === cols) return;
+
+  const size = { rows, cols };
+  if (!currentSerialSizeBinding()) {
+    state.serialSizeBinding = binding;
+    saveSettings();
+  }
+  serialSizeSyncAttempt = size;
+  serialSizeSyncRunning = true;
+  try {
+    await invoke<void>("sync_serial_terminal_size", { ...binding, size });
+    if (serialSizeSyncAttempt === size) setSerialSizeSyncError("");
+  } catch (error) {
+    if (serialSizeSyncAttempt === size) setSerialSizeSyncError(`自动同步尺寸失败：${toMessage(error)}`);
+  } finally {
+    serialSizeSyncRunning = false;
+    if (serialSizeSyncTimer === undefined) queueSerialSizeSync();
+  }
+}
+
+function resetSerialSizeSync(): void {
+  window.clearTimeout(serialSizeSyncTimer);
+  serialSizeSyncTimer = undefined;
+  serialSizeSyncAttempt = undefined;
+  serialResizeEdge = undefined;
+  setSerialSizeSyncError("");
+}
+
+function captureSerialResizeEdge(): SerialResizeEdge | undefined {
+  const { active: buffer } = terminal.buffer;
+  if (!serialSizeSyncTarget() || buffer.type !== "normal") return;
+  const cols = terminal.cols;
+  const line = buffer.baseY + buffer.cursorY;
+  const row = buffer.getLine(line);
+  const lastCell = row?.getCell(cols - 1)?.getChars();
+  if (!row || !lastCell?.trim()) return;
+
+  return { cols, line, contents: row.translateToString(), lastCell, redrawing: false, previousByte: 0 };
+}
+
+function serialResizeRedrawBackspace(edge: SerialResizeEdge, bytes: Uint8Array): number {
+  for (const [index, byte] of bytes.entries()) {
+    if (byte === 0x0a) {
+      serialResizeEdge = undefined;
+      break;
+    }
+
+    const previousByte = edge.previousByte;
+    edge.previousByte = byte;
+    if (byte === 0x0d) {
+      edge.redrawing = true;
+    } else if (byte < 0x20 && edge.redrawing) {
+      edge.redrawing = false;
+      // mksh rewrites the line with padding and an optional overflow marker,
+      // then emits backspaces to return to the editing cursor.
+      if (byte === 0x08 && (previousByte === 0x20 || previousByte === 0x2a ||
+          previousByte === 0x3c || previousByte === 0x3e)) {
+        return index;
+      }
+    }
+  }
+  return -1;
+}
+
+function eraseSerialResizeEdge(edge: SerialResizeEdge): void {
+  if (serialResizeEdge !== edge) return;
+  serialResizeEdge = undefined;
+  if (!serialSizeSyncTarget() || terminal.cols !== edge.cols) return;
+  const buffer = terminal.buffer.active;
+  if (buffer.type !== "normal" || buffer.baseY + buffer.cursorY !== edge.line ||
+      buffer.cursorX !== edge.cols - 1) return;
+  const row = buffer.getLine(edge.line);
+  if (!row || row.translateToString() === edge.contents ||
+      row.getCell(edge.cols - 1)?.getChars() !== edge.lastCell) return;
+
+  // The redraw stopped before the final cell. Erase that cell in xterm
+  // without moving the cursor or sending any bytes to the device.
+  terminal.write("\x1b[X");
+}
+
+function setSerialSizeSyncError(message: string): void {
+  serialSizeSyncError = message;
+  const status = document.querySelector<HTMLDivElement>("#serial-size-sync-error");
+  if (status) {
+    status.textContent = message;
+    status.hidden = !message;
+  }
 }
 
 function updateStats(): void {
@@ -2172,7 +2360,7 @@ function drainTerminalOutput(session: TerminalSession): void {
   const bytes = takeTerminalOutputChunk(session);
   session.outputWriting = true;
   const start = performance.now();
-  session.terminal.write(bytes, () => {
+  const written = () => {
     session.outputWriting = false;
     const elapsed = performance.now() - start;
     if (elapsed > perfWarnMs) {
@@ -2184,7 +2372,21 @@ function drainTerminalOutput(session: TerminalSession): void {
     if (session.pendingOutputBytes > 0) {
       queueMicrotask(() => drainTerminalOutput(session));
     }
-  });
+  };
+  const edge = session.kind === "serial" && serialSizeSyncAttempt?.cols === terminal.cols
+    ? serialResizeEdge
+    : undefined;
+  const backspace = edge ? serialResizeRedrawBackspace(edge, bytes) : -1;
+  if (edge && backspace >= 0) {
+    const finishRedraw = () => {
+      eraseSerialResizeEdge(edge);
+      session.terminal.write(bytes.subarray(backspace), written);
+    };
+    if (backspace === 0) finishRedraw();
+    else session.terminal.write(bytes.subarray(0, backspace), finishRedraw);
+  } else {
+    session.terminal.write(bytes, written);
+  }
 }
 
 function takeTerminalOutputChunk(session: TerminalSession): Uint8Array {
@@ -2320,6 +2522,7 @@ function normalizeSavedSettings(value: SavedSettings): SavedSettings {
   const selectedAdbDevice =
     typeof value.selectedAdbDevice === "string" ? value.selectedAdbDevice.trim() : "";
   const scrcpyOptions = value.scrcpyOptions ?? {};
+  const binding = value.serialSizeBinding;
 
   return {
     config: {
@@ -2332,6 +2535,11 @@ function normalizeSavedSettings(value: SavedSettings): SavedSettings {
       parity,
       stop_bits: config.stop_bits === 2 ? 2 : 1,
     },
+    serialSizeSyncEnabled: value.serialSizeSyncEnabled !== false,
+    serialSizeBinding: typeof binding?.portName === "string" && binding.portName &&
+      typeof binding.deviceId === "string" && binding.deviceId.trim()
+      ? { portName: binding.portName, deviceId: binding.deviceId.trim() }
+      : undefined,
     fontFamily:
       typeof value.fontFamily === "string" && value.fontFamily.length > 0
         ? value.fontFamily
@@ -2359,6 +2567,8 @@ function normalizeSavedSettings(value: SavedSettings): SavedSettings {
 function saveSettings(): void {
   const value: SavedSettings = {
     config: state.config,
+    serialSizeSyncEnabled: state.serialSizeSyncEnabled,
+    serialSizeBinding: state.serialSizeBinding,
     fontFamily: state.fontFamily,
     fontSize: state.fontSize,
     lineSpacing: state.lineSpacing,
@@ -2781,6 +2991,7 @@ async function setupBackendListeners(): Promise<void> {
   await listen<SerialErrorPayload>("serial-error", (event) => {
     state.mode = "error";
     state.lastError = event.payload.message;
+    resetSerialSizeSync();
     clearPendingSerialText();
     clearPendingTerminalOutput();
     terminal.writeln(`\x1b[31m${event.payload.message}\x1b[0m`);

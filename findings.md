@@ -18,6 +18,11 @@
 - 用户反馈窗口拉伸时终端区域与窗口边框之间会出现黑色区域，拉伸变大后黑色区域周期性变大/消失。
 
 ## 研究发现
+- 阶段 42：自动同步的开启状态与端口绑定分开保存。旧配置没有开启状态时默认为开启。首次同步时使用当前选中的在线 ADB 设备，已有绑定优先，设备晚于串口上线时主动同步。
+- 阶段 41：xterm 缩窄时会截短光标所在行，保留仍可见的单元格。实机 mksh 重绘发出回车、输入窗口和越界标记、回退字符，写到倒数第二列。旧末列因此可能遗留字形。修复仅在收到这类重绘、确认它停在末列之前且残留单元格仍是缩窗前的内容时插入 xterm 本地 ECH。参考 https://android.googlesource.com/platform/external/mksh/+/refs/tags/android-mainline-12.0.0_r100/src/edit.c 。
+- 阶段 40：实机 ADB 设备 `2253005` 的 `ro.boot.console` 为 `ttyFIQ0`，普通 ADB Shell 无权打开该 tty，设备自带的 `su 0 stty -F /dev/ttyFIQ0 size` 可读取行列数。通过 ADB 调整 tty 可让内核通知前台进程组，无需往串口输入流插入命令。参考 https://man7.org/linux/man-pages/man2/TIOCGWINSZ.2const.html 。
+- 阶段 39：`LINES` / `COLUMNS` 的本地赋值也会刷新 Android mksh 内部编辑尺寸，覆盖 `stty` 在前台子进程组执行、Shell 自身未处理尺寸信号的情况。参考 https://android.googlesource.com/platform/external/mksh/+/f688e8a1ab15366682b71b040c32e1518ff7bd50/src/var.c 。
+- 阶段 39：用户实机上 `/system/bin/sh` 的 `stty size` 持续为 `0 0`。Android mksh 在 tty 无有效尺寸时回退默认列数。Android toybox `stty` 支持 `rows N cols N`，可将当前 xterm 行列数写入当前串口 tty。参考 https://android.googlesource.com/platform/system/core/+/2c42e4404bba0a1b065d223a1e84ef7184e1a987/mksh/src/var.c 和 https://android.googlesource.com/platform/external/toybox/+/988e2e2ba7c9a7540de39bb77185f20c83da8eb6/android/device/generated/help.h 。
 - 阶段 38 更正：用户要求列数实际随窗口变小，撤销最小 80 列及横向滚动。Windows CLI 的输出是管道时无法调用 GetConsoleScreenBufferInfo 获取尺寸，Windows 客户端也不通过 SIGWINCH 更新。使用 ADB server 的 shell v2 PTY，在打开时及后续缩放时发送 WindowSizeChange 帧，和键盘字节共用发送队列。串口协议不携带 PTY 尺寸，启用 xterm 的 `CSI 18 t` 实际行列查询响应。实机端是否会请求或应用该尺寸取决于 Shell。参考 https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/client/commandline.cpp 和 https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/daemon/shell_service.cpp 。
 - 阶段 38：前端的 FitAddon 随终端容器收窄列数，串口仅传输字节。ADB Shell 使用 `-tt` 和重定向管道，Windows ADB 客户端从控制台查询宽度失败时不会发送尺寸；mksh 无有效尺寸时按 80 列重绘。以 80 列 Shell 回显验证显示错位，并采用最少 80 列加横向滚动。参考 https://android.googlesource.com/platform/system/core/+/19322dddc67223a5ff9932945fb0ea4147505e55/adb/client/commandline.cpp 和 https://android.googlesource.com/platform/external/mksh/+/95541002559cd8834d7093898453dcb3f5061b6e/src/var.c 。
 - 阶段 37（按用户澄清收窄）：仅拆输入框外观，四段 IP 加一段端口，点击或 Tab 聚焦时选中该段；组合回原地址字符串，沿用历史回填、连接与默认端口逻辑，不加格式校验/整地址粘贴/自动跳转。已有主机名或 IPv6 地址仍沿用单框显示，避免丢失内容。

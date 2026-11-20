@@ -32,7 +32,11 @@ let failClipboardRead = false;
 let failClipboardCopy = false;
 const clipboardDirectories = new Set<string>();
 let reportedSerialColumns = 0;
+let reportedSerialRows = 0;
+let mockSerialColumns = 0;
 let mockAdbColumns = 0;
+let serialSizeSyncDelay = 0;
+let serialSizeSyncInFlight = 0;
 const promptPrefix = "$ ls /data/";
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 localStorage.setItem("serial-terminal-settings-v1", JSON.stringify({ selectedAdbDevice: "TEST-A" }));
@@ -45,15 +49,28 @@ mockIPC(async (command, args: any = {}) => {
     mockAdbColumns = args.size.cols;
     return { device_id: args.deviceId, shell_id: 1 };
   }
+  if (command === "sync_serial_terminal_size") {
+    assert(++serialSizeSyncInFlight === 1, "serial resizes are applied in order");
+    try {
+      await delay(serialSizeSyncDelay);
+      mockSerialColumns = args.size.cols;
+    } finally {
+      --serialSizeSyncInFlight;
+    }
+    return null;
+  }
   if (command === "write_adb_shell" || command === "write_text") {
     const isAdb = command === "write_adb_shell";
     if (isAdb && !args.text) mockAdbColumns = args.size.cols;
     if (!isAdb) {
-      const report = /^\x1b\[8;\d+;(\d+)t$/.exec(args.text);
-      if (report) reportedSerialColumns = Number(report[1]);
+      const report = /^\x1b\[8;(\d+);(\d+)t$/.exec(args.text);
+      if (report) {
+        reportedSerialRows = Number(report[1]);
+        reportedSerialColumns = Number(report[2]);
+      }
     }
     if (args.text === "\t") {
-      const cols = isAdb ? mockAdbColumns : reportedSerialColumns;
+      const cols = (isAdb ? mockAdbColumns : mockSerialColumns) || 80;
       const line = promptPrefix + "directory/".repeat(8) + "completed";
       const wrappedRows = Math.floor((line.length - 1) / cols);
       const data = `\r\x1b[J${line}\x1b[${wrappedRows}A\r\x1b[5C`;
@@ -1010,7 +1027,12 @@ document.querySelector("#run-terminal-resize-tests")!.addEventListener("click", 
     input.focus();
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", code: "Tab", keyCode: 9, bubbles: true, cancelable: true }));
   };
-  const cursorOnPrompt = () => document.querySelector("#terminal-host .xterm-cursor")?.parentElement?.textContent?.startsWith(promptPrefix) === true;
+  const sizeAction = '[data-terminal-menu-action="serial-size"]';
+  const autoSizeAction = '[data-terminal-menu-action="serial-size-auto"]';
+  const syncCalls = () => calls.filter(call => call.command === "sync_serial_terminal_size");
+  const cursorLine = () => document.querySelector("#terminal-host .xterm-cursor")?.parentElement?.textContent ?? "";
+  const cursorOnPrompt = () => cursorLine().startsWith(promptPrefix);
+  const serialOutput = (data: string) => emit("serial-data", { data: btoa(data), byte_count: data.length });
   const query = async () => {
     reportedSerialColumns = 0;
     await emit("serial-data", { data: btoa("\x1b[18t"), byte_count: 5 });
@@ -1020,6 +1042,13 @@ document.querySelector("#run-terminal-resize-tests")!.addEventListener("click", 
   try {
     fit(1400);
     await waitFor(() => !document.querySelector<HTMLButtonElement>("#adb-shell-open")!.disabled && !!document.querySelector("#terminal-host .xterm-cursor"), "mock devices and terminal ready");
+    rightClick("#terminal-host");
+    assert(!document.querySelector(sizeAction), "manual dimension command has been removed");
+    assert(document.querySelector(autoSizeAction)?.textContent?.includes("关闭自动尺寸同步"), "serial size sync is enabled by default");
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    hideAdbDevices = true;
+    click("#refresh-scrcpy-devices");
+    await waitFor(() => document.querySelector<HTMLButtonElement>("#adb-shell-open")!.disabled, "ADB is unavailable before connecting serial");
     click("#connection-toggle");
     await waitFor(() => document.querySelector("#connection-toggle")?.textContent?.includes("关闭串口") === true, "serial connected");
     const wideSerial = await query();
@@ -1027,23 +1056,84 @@ document.querySelector("#run-terminal-resize-tests")!.addEventListener("click", 
     await delay(80);
     const narrowSerial = await query();
     assert(wideSerial > 80 && narrowSerial < 50, "serial reply follows actual window width");
-    tab();
-    await waitFor(cursorOnPrompt, "serial completion redraw moves cursor to its intended row");
+    assert(syncCalls().length === 0, "wait for ADB to become available");
 
+    const serialWritesBefore = calls.filter(call => call.command === "write_text").length;
+    hideAdbDevices = false;
+    click("#refresh-scrcpy-devices");
+    await waitFor(() => syncCalls().length === 1 && mockSerialColumns === narrowSerial, "late ADB availability triggers automatic sync");
+    const initialSize = syncCalls()[0].args;
+    assert(initialSize.portName === "COM5" && initialSize.deviceId === "TEST-A" &&
+      initialSize.size.rows === reportedSerialRows && initialSize.size.cols === narrowSerial, "bind the current port and connected ADB device");
+    const saved = JSON.parse(localStorage.getItem("serial-terminal-settings-v1")!);
+    assert(saved.serialSizeSyncEnabled && saved.serialSizeBinding.portName === "COM5" &&
+      saved.serialSizeBinding.deviceId === "TEST-A", "persist the automatically selected device");
+
+    click('[data-picker-id="adbDevice"]');
+    click('[data-picker-value="TEST-B"]');
+    serialSizeSyncDelay = 400;
+    fit(1000);
+    await waitFor(() => syncCalls().length === 2 && serialSizeSyncInFlight === 1, "start a slow resize");
+    fit(650);
+    await delay(30);
+    fit(500);
+    await waitFor(() => syncCalls().length === 3 && serialSizeSyncInFlight === 0, "deliver the latest size after the in-flight resize");
+    assert(calls.filter(call => call.command === "write_text").length === serialWritesBefore, "auto-sync doesn't write commands to the serial input");
+    const autoColumns = await query();
+    assert(mockSerialColumns === autoColumns && syncCalls().every(call => call.args.deviceId === "TEST-A"), "fit the true width without switching the bound ADB device");
+    tab();
+    await waitFor(cursorOnPrompt, "completion works after automatic resize");
+
+    serialSizeSyncDelay = 0;
+    const shrinkWithOutput = async (character: string) => {
+      fit(1400);
+      await waitFor(() => mockSerialColumns > 90, "serial is wide enough to type a long line");
+      const line = character.repeat(80);
+      await serialOutput("\r\n" + line);
+      await waitFor(() => cursorLine().includes(line), "long unsubmitted line appears in the terminal");
+      fit(380);
+      await waitFor(() => mockSerialColumns < 50 && syncCalls().at(-1)?.args.size.cols === mockSerialColumns, "fit and sync the narrow terminal");
+      return mockSerialColumns;
+    };
+
+    const redrawCols = await shrinkWithOutput("Q");
+    await serialOutput("\r");
+    await serialOutput("resized input".padEnd(redrawCols - 2) + "<");
+    await waitFor(() => cursorLine().trimEnd().endsWith("<Q"), "mksh repaint reserves the stale last cell");
+    await serialOutput("\b".repeat(redrawCols - 1 - "resized input".length));
+    await waitFor(() => cursorLine().trimEnd().endsWith("<"), "split mksh redraw clears only the stale final cell");
+
+    const fullWidthCols = await shrinkWithOutput("<");
+    await serialOutput("\r" + "full-width output".padEnd(fullWidthCols - 1) + "<\b");
+    await waitFor(() => cursorLine().startsWith("full-width output"), "full-width redraw appears");
+    assert(cursorLine().trimEnd().endsWith("<"), "a redraw that writes the last cell preserves it");
+
+    const syncCountBeforeDisable = syncCalls().length;
+    rightClick("#terminal-host");
+    assert(document.querySelector(autoSizeAction)?.textContent?.includes("关闭自动尺寸同步"), "offer to turn off auto-sync");
+    click(autoSizeAction);
+    serialSizeSyncDelay = 0;
     fit(1400);
+    await delay(250);
+    assert(syncCalls().length === syncCountBeforeDisable, "disabling auto-sync stops requests");
+    assert(JSON.parse(localStorage.getItem("serial-terminal-settings-v1")!).serialSizeSyncEnabled === false, "persist the explicit opt-out");
     click("#adb-shell-open");
     await waitFor(() => mockAdbColumns > 80, "ADB starts with fitted size");
+    rightClick("#terminal-host");
+    assert(!document.querySelector(sizeAction) && !document.querySelector(autoSizeAction), "ADB Shell already syncs its own size");
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     fit(380);
     await waitFor(() => mockAdbColumns < 50, "ADB gets smaller size before input");
     tab();
     await waitFor(cursorOnPrompt, "ADB completion redraw moves cursor to its intended row");
     fit(1400);
     await waitFor(() => mockAdbColumns > 80, "ADB size returns to wide layout");
-    result.textContent = "PASS：终端随窗口缩放，串口尺寸查询和 ADB 尺寸通知回归通过";
+    result.textContent = "PASS：串口默认自动同步、移除手动命令、缩放残影和 ADB Shell 尺寸通知回归通过";
   } catch (error) {
     result.textContent = `FAIL：${String(error)}`;
     console.error(error);
   } finally {
+    hideAdbDevices = false;
     layout.remove();
   }
 });
